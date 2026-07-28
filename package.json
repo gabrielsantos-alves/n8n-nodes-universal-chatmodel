@@ -1,0 +1,71 @@
+{
+  "name": "n8n-nodes-universal-chatmodel",
+  "version": "1.0.23",
+  "description": "Production-oriented n8n community Chat Model for native Google Gemini and OpenAI-compatible APIs",
+  "keywords": [
+    "n8n-community-node-package",
+    "n8n",
+    "chat-model",
+    "ai-agent",
+    "gemini",
+    "openai-compatible",
+    "deepseek",
+    "ollama",
+    "lmstudio",
+    "localai",
+    "vllm",
+    "langchain"
+  ],
+  "author": "Gabriel Santos",
+  "license": "MIT",
+  "main": "dist/nodes/UniversalChatModel/UniversalChatModel.node.js",
+  "types": "dist/nodes/UniversalChatModel/UniversalChatModel.node.d.ts",
+  "sideEffects": true,
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.19 <=24.x"
+  },
+  "scripts": {
+    "clean": "node scripts/clean.cjs",
+    "build": "npm run clean && tsc && node scripts/copy-assets.cjs",
+    "dev": "tsc --watch",
+    "test": "npm run build && node --test tests/*.test.cjs",
+    "verify:package": "node scripts/verify-package.cjs",
+    "verify:artifact": "node scripts/verify-artifact.cjs",
+    "prepare": "npm run build",
+    "prepack": "npm test && npm run verify:package"
+  },
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "nodes": [
+      "dist/nodes/UniversalChatModel/UniversalChatModel.node.js"
+    ],
+    "credentials": [
+      "dist/credentials/GoogleGeminiApi.credentials.js",
+      "dist/credentials/OpenAiCompatibleApi.credentials.js"
+    ]
+  },
+  "dependencies": {
+    "@langchain/core": "1.2.3",
+    "@langchain/google": "0.2.1",
+    "@langchain/openai": "1.1.3"
+  },
+  "peerDependencies": {
+    "n8n-workflow": ">=2.2.3 <3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "langchain-core-n8n-225": "npm:@langchain/core@1.1.0",
+    "n8n-workflow": "2.2.3",
+    "typescript": "^5.3.3",
+    "zod": "3.25.76"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
