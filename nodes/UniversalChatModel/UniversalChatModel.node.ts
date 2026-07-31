@@ -475,10 +475,10 @@ export function getModelExecutionSettings(
 }
 
 /**
- * n8n 2.2.x still renders the common execution settings for language-model
- * subnodes. Newer editors intentionally hide them, so the node supplies an
- * equivalent set only there. The loader module is inside n8n/n8n-core, which
- * lets us identify the running host without adding a dependency on n8n itself.
+ * Current n8n editors, including 2.32.6, hide common execution settings for
+ * language-model subnodes. The node supplies an equivalent set in that case.
+ * The loader module is inside n8n/n8n-core, which lets us identify the running
+ * host without adding a dependency on n8n itself.
  */
 function shouldExposeModelExecutionProperties(): boolean {
   let parentModule = module.parent;
@@ -846,8 +846,8 @@ export class UniversalChatModel implements INodeType {
     properties: [
       ...(shouldExposeModelExecutionProperties()
         ? ([
-            // n8n 2.2.5 supplies these as common settings. Newer editors hide
-            // common settings for model subnodes, so expose equivalents.
+            // n8n 2.32.6 hides common settings for model subnodes, so expose
+            // equivalent native node settings for runtime and canvas status.
             {
               displayName: 'Always Output Data',
               name: 'alwaysOutputData',
@@ -1072,6 +1072,13 @@ export class UniversalChatModel implements INodeType {
             description: 'Return available thought summaries in model and AI Agent metadata. Thoughts remain hidden unless this option is enabled.',
           },
           {
+            displayName: 'Recover Empty Final Responses',
+            name: 'recoverEmptyResponses',
+            type: 'boolean',
+            default: true,
+            description: 'Automatically makes one safe continuation request when Gemini returns STOP with no text and no function call. Valid tool calls are never retried.',
+          },
+          {
             displayName: 'Safety Settings',
             name: 'safetySettings',
             type: 'fixedCollection',
@@ -1117,30 +1124,11 @@ export class UniversalChatModel implements INodeType {
 
       // ─── 3. OPENAI / LOCAL LLM — Required Fields ───
       {
-        displayName: 'Base URL (Override)',
-        name: 'baseUrl',
-        type: 'string',
-        displayOptions: { show: { provider: ['openai_compatible'] } },
-        default: '',
-        placeholder: 'http://localhost:11434/v1',
-        description: 'Endpoint base URL (overrides credential if provided)',
-      },
-      {
-        displayName: 'API Key (Override)',
-        name: 'openaiApiKey',
-        type: 'string',
-        typeOptions: { password: true },
-        displayOptions: { show: { provider: ['openai_compatible'] } },
-        default: '',
-        description: 'API key override for OpenAI / OpenRouter / DeepSeek or local proxy',
-      },
-      {
         displayName: 'Model Name / ID',
         name: 'openaiModel',
         type: 'options',
         typeOptions: {
           loadOptionsMethod: 'getOpenAiModels',
-          loadOptionsDependsOn: ['baseUrl', 'openaiApiKey'],
         },
         displayOptions: { show: { provider: ['openai_compatible'] } },
         default: 'llama3',
@@ -1293,10 +1281,6 @@ export class UniversalChatModel implements INodeType {
           if (creds && typeof creds.apiKey === 'string' && creds.apiKey.trim()) apiKey = creds.apiKey.trim();
         } catch { /* ignore */ }
 
-        const paramBaseUrl = (this.getNodeParameter('baseUrl', '') as string) || '';
-        const paramApiKey = (this.getNodeParameter('openaiApiKey', '') as string) || '';
-        if (paramBaseUrl.trim()) baseUrl = paramBaseUrl.trim();
-        if (paramApiKey.trim()) apiKey = paramApiKey.trim();
         baseUrl = baseUrl.replace(/\/+$/, '');
 
         const defaultModels: INodePropertyOptions[] = [
@@ -1368,6 +1352,7 @@ export class UniversalChatModel implements INodeType {
         thinkingLevel?: string;
         thinkingBudget?: number;
         includeThoughts?: boolean;
+        recoverEmptyResponses?: boolean;
         safetySettings?: { values?: Array<{ category: string; threshold: string }> };
       };
 
@@ -1462,6 +1447,7 @@ export class UniversalChatModel implements INodeType {
         apiKey: geminiApiKey,
         model: geminiModel,
         maxRetries: 0,
+        recoverEmptyResponses: opts.recoverEmptyResponses !== false,
       };
       const usageReporter = await createUsageReporter(
         this,
@@ -1512,10 +1498,6 @@ export class UniversalChatModel implements INodeType {
         if (creds && typeof creds.apiKey === 'string' && creds.apiKey.trim()) openaiApiKey = creds.apiKey.trim();
       } catch { /* ignore */ }
 
-      const paramBaseUrl = this.getNodeParameter('baseUrl', executionItemIndex, '') as string;
-      const paramApiKey = this.getNodeParameter('openaiApiKey', executionItemIndex, '') as string;
-      if (paramBaseUrl.trim()) baseUrl = paramBaseUrl.trim();
-      if (paramApiKey.trim()) openaiApiKey = paramApiKey.trim();
       baseUrl = baseUrl.replace(/\/+$/, '');
 
       // Resolve model

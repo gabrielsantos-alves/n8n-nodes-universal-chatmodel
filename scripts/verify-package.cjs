@@ -25,6 +25,21 @@ if (!packageJson.keywords.includes('n8n-community-node-package')) {
   );
 }
 
+if (packageJson.engines?.node !== '>=22.22 <25') {
+  throw new Error('Node.js compatibility must remain aligned with n8n 2.32.6.');
+}
+
+if (packageJson.peerDependencies?.['n8n-workflow'] !== '>=2.32.1 <3.0.0') {
+  throw new Error('n8n-workflow peer compatibility must target n8n 2.32.6.');
+}
+
+if (
+  packageJson.repository?.url !==
+  'git+https://github.com/gabrielsantos-alves/n8n-nodes-universal-chatmodel.git'
+) {
+  throw new Error('GitHub repository metadata is missing or incorrect.');
+}
+
 const missingFiles = expectedFiles.filter(
   (file) => !existsSync(resolve(projectRoot, file)),
 );

@@ -1,8 +1,7 @@
 node_modules/
 dist/
 coverage/
-.npm/
-.npm-cache/
+.npm*/
 *.tgz
 *.log
 .env

@@ -2,6 +2,51 @@
 
 Todas as mudanças relevantes deste projeto serão registradas aqui.
 
+## 1.0.26 — 2026-07-31
+
+- Atualiza o alvo de produção para **n8n 2.32.6** e Node.js 22.22–24.x.
+- Alinha `n8n-workflow` a 2.32.1, versão usada pelo n8n 2.32.6.
+- Valida interoperabilidade com `@n8n/n8n-nodes-langchain` 2.32.4 e o
+  `@langchain/core` 1.2.0 usado por esse pacote.
+- Atualiza `@langchain/core` para 1.2.4 e `@langchain/openai` para 1.5.5.
+- Mantém compatibilidade com o AI Agent V3, tools estruturadas, tool loops,
+  streaming, thoughts, token usage e recuperação de resposta final vazia.
+- Adiciona metadados do repositório GitHub e CI para validar build, testes e
+  `npm publish --dry-run` antes da publicação manual pelo Codespaces.
+- Amplia a suíte para 64 testes, incluindo uma verificação explícita do conjunto
+  de versões usado pelo n8n 2.32.6.
+
+## 1.0.25 — 2026-07-30
+
+- Força `functionCallingConfig: NONE` somente na recuperação de uma resposta
+  terminal vazia, evitando um segundo `STOP` vazio depois de loops longos com
+  ferramentas e impedindo a repetição de chamadas com efeitos colaterais.
+- Mantém `AUTO` nas chamadas normais do agente e preserva todas as function
+  calls válidas antes da recuperação.
+- Remove **Base URL (Override)** e **API Key (Override)** do formulário OpenAI
+  Compatible; ambos passam a vir exclusivamente da credencial.
+- Ignora com segurança os overrides antigos que ainda existam no JSON de
+  workflows salvos.
+- Valida o comportamento em 63 testes, incluindo loop multi-tool, recuperação,
+  streaming, Retry On Fail e credenciais OpenAI Compatible.
+
+## 1.0.24 — 2026-07-30
+
+- Detecta a diferença entre uma geração textual vazia e uma chamada estruturada
+  de ferramenta, cujo `text` vazio é esperado.
+- Recupera automaticamente uma resposta terminal `STOP` sem texto e sem
+  function call com uma única solicitação de continuação.
+- Nunca repete uma geração que contenha tool calls, evitando execução duplicada
+  de ferramentas com efeitos colaterais.
+- Soma os tokens cobrados da tentativa vazia e da recuperação em `tokenUsage`,
+  `usageMetadata`, tracing e Usage Reporter.
+- Aplica a mesma proteção a chamadas normais e streaming.
+- Converte uma segunda resposta vazia ou bloqueada em erro detalhado, em vez de
+  encerrar o AI Agent silenciosamente com `output: ""`.
+- Adiciona a opção **Recover Empty Final Responses**, ativada por padrão.
+- Valida um loop com três tools, resposta terminal vazia, recuperação, safety,
+  contagem agregada e streaming em 63 testes.
+
 ## 1.0.23 — 2026-07-28
 
 - Integra `Always Output Data`, `Execute Once`, `Retry On Fail`, `Max Tries`,

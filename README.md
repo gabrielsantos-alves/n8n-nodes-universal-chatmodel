@@ -10,11 +10,12 @@ pelo provedor, Structured Output e telemetria detalhada de tokens.
 
 ## Compatibilidade
 
-- n8n: `>= 2.2.3 < 3.0.0`
-- Versão-alvo validada: **n8n 2.2.5**
-- Node.js: `>= 20.19 <= 24.x`
+- n8n alvo e validado: **2.32.6**
+- Peer runtime: `n8n-workflow >= 2.32.1 < 3.0.0`
+- Node.js: `>= 22.22 < 25`
 - AI Agent V1, V2 e V3
-- LangChain do n8n 2.2.5 (`@langchain/core` 1.1.0)
+- Pacote AI do n8n 2.32.6: `@n8n/n8n-nodes-langchain` 2.32.4
+- Interoperabilidade validada com o `@langchain/core` 1.2.0 usado pelo pacote AI
 
 ## Recursos
 
@@ -39,11 +40,28 @@ pelo provedor, Structured Output e telemetria detalhada de tokens.
 
 - Tool calls sequenciais e paralelas.
 - Preservação dos IDs das chamadas.
+- Recuperação segura de uma resposta terminal vazia sem repetir tool calls.
 - Compatibilidade com MCP Client Tool e structured tools.
 - Thoughts, tokens e metadados separados do texto final do AI Agent.
 - Exposição de token usage no AI Agent controlada por uma opção independente.
 - System Message adicional combinado com as instruções do node pai.
 - Isolamento de metadados entre execuções concorrentes.
+
+### Recuperação de resposta vazia
+
+Uma resposta de tool calling normalmente possui `text: ""`: a informação útil
+está em `tool_calls`, e o AI Agent deve executar a ferramenta. O node não
+considera esse caso uma falha e nunca repete a chamada.
+
+Se Gemini terminar com `STOP` sem texto, sem conteúdo e sem function call, a
+opção **Recover Empty Final Responses** realiza uma única continuação segura.
+O histórico completo e os resultados das tools permanecem presentes. Se a
+continuação também vier vazia, o node devolve um erro detalhado em vez de
+produzir silenciosamente `output: ""`.
+
+Os tokens das duas requisições ao provedor são somados. O metadata
+`gemini.emptyResponseRecovery` informa quantas requisições foram feitas e os
+response IDs envolvidos.
 
 ### Uso de tokens
 
@@ -182,56 +200,22 @@ output final do AI Agent, as propriedades são promovidas para campos reais:
 }
 ```
 
-## Instalação usando o pacote `.tgz`
+## Instalação pelo n8n
 
-Este é o método recomendado para transferir o node entre instâncias.
+Como o pacote é publicado no npm, abra **Settings → Community Nodes** e instale:
 
-1. Baixe o artifact `n8n-nodes-universal-chatmodel-1.0.23.tgz` do pipeline do
-   GitLab.
-2. Copie o arquivo para o servidor da outra instância.
-3. No usuário que executa o n8n:
+```text
+n8n-nodes-universal-chatmodel
+```
+
+Para instalações manuais, use o usuário que executa o n8n:
 
 ```bash
-mkdir -p ~/.n8n/nodes
 cd ~/.n8n/nodes
-npm install /caminho/n8n-nodes-universal-chatmodel-1.0.23.tgz
+npm install n8n-nodes-universal-chatmodel@1.0.26
 ```
 
-4. Reinicie o n8n.
-
-Para atualizar, instale o novo `.tgz` no mesmo diretório e reinicie o serviço.
-
-### Docker
-
-Exemplo para um container chamado `n8n`:
-
-```bash
-docker cp n8n-nodes-universal-chatmodel-1.0.23.tgz n8n:/tmp/
-docker exec -u node n8n sh -lc \
-  'mkdir -p /home/node/.n8n/nodes && cd /home/node/.n8n/nodes && npm install /tmp/n8n-nodes-universal-chatmodel-1.0.23.tgz'
-docker restart n8n
-```
-
-Em produção, o ideal é adicionar a instalação na imagem Docker para que ela
-seja reproduzível após recriar o container.
-
-## Instalação diretamente do GitLab
-
-Dentro do diretório `~/.n8n/nodes`:
-
-```bash
-npm install "git+https://gitlab.com/SEU_USUARIO/n8n-nodes-universal-chatmodel.git#v1.0.23"
-```
-
-O script `prepare` compila o TypeScript durante a instalação.
-
-Para um repositório privado, configure autenticação SSH, Deploy Token ou um
-registry npm privado. Não coloque tokens de acesso no workflow, no histórico
-do shell ou dentro do repositório.
-
-> A tela **Settings → Community Nodes** instala pacotes por registry npm. Um
-> repositório GitLab sem publicação em registry deve ser instalado manualmente
-> ou por uma imagem Docker customizada.
+Depois, reinicie o n8n.
 
 ## Desenvolvimento
 
@@ -241,47 +225,42 @@ npm test
 npm run verify:package
 ```
 
-Gerar um pacote local:
+## Publicação no npm pelo GitHub Codespaces
+
+Depois de enviar os arquivos atualizados ao GitHub, abra um Codespace na raiz
+do repositório e execute:
 
 ```bash
-npm pack
+npm ci
+npm test
+npm publish --dry-run
+npm whoami
+npm publish
 ```
 
-O pacote gerado contém somente `dist`, README, changelog e licença.
+O `prepack` executa novamente os testes e valida os arquivos publicáveis antes
+do envio. Se sua conta npm exigir autenticação de dois fatores, o comando de
+publicação solicitará o código correspondente.
 
-## GitLab
-
-Crie um projeto vazio e execute dentro desta pasta:
+Confirme a versão publicada com:
 
 ```bash
-git init
-git branch -M main
-git add .
-git commit -m "Initial Universal Chat Model release"
-git remote add origin git@gitlab.com:SEU_USUARIO/n8n-nodes-universal-chatmodel.git
-git push -u origin main
+npm view n8n-nodes-universal-chatmodel version
 ```
 
-Para criar a primeira release:
-
-```bash
-git tag v1.0.23
-git push origin v1.0.23
-```
-
-O pipeline `.gitlab-ci.yml`:
+O workflow `.github/workflows/ci.yml`:
 
 1. instala dependências com `npm ci`;
 2. executa build e todos os testes;
 3. verifica a estrutura publicável;
-4. gera o `.tgz` como artifact.
+4. executa `npm publish --dry-run`, sem publicar ou exigir token npm.
 
 ## Segurança
 
 - Nunca faça commit de API keys, tokens do n8n, `.env`, banco SQLite ou pasta
   `.n8n`.
 - Revise os logs e execution data antes de compartilhá-los.
-- Atualize dependências somente depois de validar novamente no n8n 2.2.5.
+- Atualize dependências somente depois de validar novamente no n8n 2.32.6.
 - Tool execution acontece no AI Agent/MCP server. O Chat Model trata erros de
   API e protocolo, mas não substitui logs e observabilidade das ferramentas.
 

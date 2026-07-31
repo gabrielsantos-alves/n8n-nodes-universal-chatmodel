@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
+const { readFileSync } = require('node:fs');
 const { join } = require('node:path');
 
 const {
@@ -23,13 +24,13 @@ const {
   recordAgentModelMetadata,
 } = require('../dist/nodes/UniversalChatModel/AgentOutputBridge.js');
 const {
-  HumanMessage: N8n225HumanMessage,
-  ToolMessage: N8n225ToolMessage,
-  isAIMessage: isN8n225AIMessage,
-} = require('langchain-core-n8n-225/messages');
+  HumanMessage: N8n2326HumanMessage,
+  ToolMessage: N8n2326ToolMessage,
+  isAIMessage: isN8n2326AIMessage,
+} = require('langchain-core-n8n-2326/messages');
 const {
-  DynamicStructuredTool: N8n225DynamicStructuredTool,
-} = require('langchain-core-n8n-225/tools');
+  DynamicStructuredTool: N8n2326DynamicStructuredTool,
+} = require('langchain-core-n8n-2326/tools');
 const {
   AIMessage,
   AIMessageChunk,
@@ -75,6 +76,23 @@ function makeGeminiResponse() {
   };
 }
 
+test('package targets the runtime dependency set used by n8n 2.32.6', () => {
+  const packageJson = JSON.parse(
+    readFileSync(join(__dirname, '..', 'package.json'), 'utf8'),
+  );
+
+  assert.equal(packageJson.engines.node, '>=22.22 <25');
+  assert.equal(packageJson.peerDependencies['n8n-workflow'], '>=2.32.1 <3.0.0');
+  assert.equal(packageJson.devDependencies['n8n-workflow'], '2.32.1');
+  assert.equal(
+    packageJson.devDependencies['langchain-core-n8n-2326'],
+    'npm:@langchain/core@1.2.0',
+  );
+  assert.equal(packageJson.dependencies['@langchain/core'], '1.2.4');
+  assert.equal(packageJson.dependencies['@langchain/google'], '0.2.1');
+  assert.equal(packageJson.dependencies['@langchain/openai'], '1.5.5');
+});
+
 test('Gemini generation controls are optional collection entries', () => {
   const description = new UniversalChatModel().description;
   const options = description.properties.find((property) => property.name === 'geminiOptions');
@@ -93,6 +111,7 @@ test('Gemini generation controls are optional collection entries', () => {
       'thinkingLevel',
       'thinkingBudget',
       'includeThoughts',
+      'recoverEmptyResponses',
       'safetySettings',
       'systemMessage',
       'includeTokenUsageInAgentOutput',
@@ -116,6 +135,12 @@ test('Gemini generation controls are optional collection entries', () => {
   });
   assert.equal(
     description.properties.some((property) => property.name === 'geminiApiKey'),
+    false,
+  );
+  assert.equal(
+    description.properties.some((property) =>
+      ['baseUrl', 'openaiApiKey'].includes(property.name),
+    ),
     false,
   );
   const credentials = Object.fromEntries(
@@ -250,18 +275,25 @@ test('model execution controls are available in the Settings tab', () => {
   );
 });
 
-test('n8n 2.2.5 uses its native Settings without duplicate model controls', () => {
+test('n8n 2.32.6 exposes the model execution settings hidden for subnodes', () => {
   const fixture = join(
     __dirname,
     'fixtures',
-    'n8n-core-2.2.3',
+    'n8n-core-2.32.1',
     'load-node.cjs',
   );
   const output = execFileSync(process.execPath, [fixture], {
     encoding: 'utf8',
   });
 
-  assert.deepEqual(JSON.parse(output), []);
+  assert.deepEqual(JSON.parse(output), [
+    'alwaysOutputData',
+    'executeOnce',
+    'retryOnFail',
+    'maxTries',
+    'waitBetweenTries',
+    'onError',
+  ]);
 });
 
 test('native node fields resolve all execution settings used by the runtime', () => {
@@ -357,7 +389,7 @@ test('Retry On Fail retries Gemini calls using Max Tries', async () => {
   }
 });
 
-test('native n8n 2.2.5 retry settings drive model API retries', async () => {
+test('native n8n 2.32.6 retry settings drive model API retries', async () => {
   const originalFetch = global.fetch;
   let calls = 0;
   global.fetch = async () => {
@@ -593,7 +625,7 @@ test('Gemini error mapper preserves safe API details and redacts credentials', (
     {
       name: 'RequestError',
       statusCode: 400,
-      url: 'https://generativelanguage.googleapis.com/v1beta/models/test?key=AIza012345678901234567890123456789',
+      url: 'https://generativelanguage.googleapis.com/v1beta/models/test?key=FAKE_TEST_KEY',
       headers: {
         'x-goog-request-id': 'request-123',
         authorization: 'Bearer should-not-appear',
@@ -603,7 +635,7 @@ test('Gemini error mapper preserves safe API details and redacts credentials', (
           code: 400,
           status: 'INVALID_ARGUMENT',
           message:
-            'Bad request using Bearer secret-token and key=AIza012345678901234567890123456789',
+            'Bad request using Bearer secret-token and key=FAKE_TEST_KEY',
           details: [
             {
               reason: 'INVALID_SCHEMA',
@@ -709,8 +741,12 @@ test('Retry On Fail does not retry a non-transient Gemini request error', async 
 test('Retry On Fail also retries OpenAI-compatible model calls', async () => {
   const originalFetch = global.fetch;
   let calls = 0;
-  global.fetch = async () => {
+  const requestUrls = [];
+  global.fetch = async (request) => {
     calls += 1;
+    requestUrls.push(
+      typeof request === 'string' ? request : request.url,
+    );
     if (calls === 1) {
       return new Response(
         JSON.stringify({ error: { message: 'temporarily unavailable' } }),
@@ -750,6 +786,8 @@ test('Retry On Fail also retries OpenAI-compatible model calls', async () => {
 
   const parameters = {
     provider: 'openai_compatible',
+    baseUrl: 'https://legacy-override.invalid/v1',
+    openaiApiKey: 'legacy-override-must-be-ignored',
     openaiModel: 'test-model',
     openaiOptions: {},
     modelRetryOnFail: true,
@@ -785,6 +823,12 @@ test('Retry On Fail also retries OpenAI-compatible model calls', async () => {
 
     assert.equal(calls, 2);
     assert.equal(response.text, 'Resposta OpenAI');
+    assert.equal(
+      requestUrls.every((url) =>
+        url.startsWith('https://example.test/v1/'),
+      ),
+      true,
+    );
   } finally {
     global.fetch = originalFetch;
   }
@@ -1695,7 +1739,7 @@ test('concurrent Gemini requests keep raw thoughts and usage metadata isolated',
   }
 });
 
-test('Gemini model interoperates with LangChain 1.1 messages from n8n 2.2.5', async () => {
+test('Gemini model interoperates with LangChain 1.2 messages from n8n 2.32.6', async () => {
   const originalFetch = global.fetch;
   global.fetch = async () =>
     new Response(JSON.stringify(makeGeminiResponse()), {
@@ -1709,10 +1753,10 @@ test('Gemini model interoperates with LangChain 1.1 messages from n8n 2.2.5', as
       model: 'gemini-2.5-flash',
       thinkingConfig: { thinkingBudget: 256, includeThoughts: true },
     });
-    const n8n225Message = new N8n225HumanMessage('mensagem criada pelo LangChain do n8n 2.2.5');
-    const response = await model.invoke([n8n225Message]);
+    const n8n2326Message = new N8n2326HumanMessage('mensagem criada pelo LangChain do n8n 2.32.6');
+    const response = await model.invoke([n8n2326Message]);
 
-    assert.equal(isN8n225AIMessage(response), true);
+    assert.equal(isN8n2326AIMessage(response), true);
     assert.equal(response.text, 'Resposta final');
     assert.equal(response.content[0].thought, undefined);
     assert.equal(response.response_metadata.thoughts[0].thought, true);
@@ -1722,7 +1766,7 @@ test('Gemini model interoperates with LangChain 1.1 messages from n8n 2.2.5', as
   }
 });
 
-test('Gemini binds structured tools created by the LangChain version in n8n 2.2.5', async () => {
+test('Gemini binds structured tools created by the LangChain version in n8n 2.32.6', async () => {
   const originalFetch = global.fetch;
   let requestBody;
   global.fetch = async (request) => {
@@ -1760,7 +1804,7 @@ test('Gemini binds structured tools created by the LangChain version in n8n 2.2.
   };
 
   try {
-    const tool = new N8n225DynamicStructuredTool({
+    const tool = new N8n2326DynamicStructuredTool({
       name: 'lookup_order',
       description: 'Look up an order by ID',
       schema: z.object({
@@ -1780,7 +1824,7 @@ test('Gemini binds structured tools created by the LangChain version in n8n 2.2.
       },
     }).bindTools([tool]);
     const response = await model.invoke([
-      new N8n225HumanMessage('Consulte o pedido 123'),
+      new N8n2326HumanMessage('Consulte o pedido 123'),
     ]);
 
     assert.equal(response.tool_calls[0].name, 'lookup_order');
@@ -1919,14 +1963,14 @@ test('Gemini agent tool loop preserves call IDs and thought signatures across se
         ],
       },
     ]);
-    const human = new N8n225HumanMessage('Encontre uma turbina em estoque');
+    const human = new N8n2326HumanMessage('Encontre uma turbina em estoque');
 
     const first = await agentModel.invoke([human]);
     assert.equal(first.tool_calls[0].id, 'call-search-1');
     assert.equal(first.tool_calls[0].name, 'search_catalog');
     assert.equal(first.tool_calls[0].thoughtSignature, 'signature-search-1');
 
-    const searchResult = new N8n225ToolMessage({
+    const searchResult = new N8n2326ToolMessage({
       content: JSON.stringify({ sku: 'TURB-001' }),
       tool_call_id: 'call-search-1',
       name: 'search_catalog',
@@ -1936,7 +1980,7 @@ test('Gemini agent tool loop preserves call IDs and thought signatures across se
     assert.equal(second.tool_calls[0].name, 'check_stock');
     assert.equal(second.tool_calls[0].thoughtSignature, 'signature-stock-2');
 
-    const stockResult = new N8n225ToolMessage({
+    const stockResult = new N8n2326ToolMessage({
       content: JSON.stringify({ available: true }),
       tool_call_id: 'call-stock-2',
       name: 'check_stock',
@@ -1994,6 +2038,429 @@ test('Gemini agent tool loop preserves call IDs and thought signatures across se
         { id: 'call-search-1', name: 'search_catalog' },
         { id: 'call-stock-2', name: 'check_stock' },
       ],
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Gemini automatically recovers one truly empty STOP response and aggregates billed usage', async () => {
+  const originalFetch = global.fetch;
+  const requestBodies = [];
+  const reportedUsage = [];
+  const responses = [
+    {
+      candidates: [
+        {
+          content: { role: 'model', parts: [] },
+          finishReason: 'STOP',
+          index: 0,
+        },
+      ],
+      usageMetadata: {
+        promptTokenCount: 17024,
+        totalTokenCount: 17024,
+        promptTokensDetails: [{ modality: 'TEXT', tokenCount: 17024 }],
+      },
+      modelVersion: 'gemini-3.6-flash',
+      responseId: 'empty-response',
+    },
+    {
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: [{ text: 'Resposta final recuperada.' }],
+          },
+          finishReason: 'STOP',
+          index: 0,
+        },
+      ],
+      usageMetadata: {
+        promptTokenCount: 17062,
+        candidatesTokenCount: 8,
+        thoughtsTokenCount: 16,
+        totalTokenCount: 17086,
+        promptTokensDetails: [{ modality: 'TEXT', tokenCount: 17062 }],
+        candidatesTokensDetails: [{ modality: 'TEXT', tokenCount: 8 }],
+      },
+      modelVersion: 'gemini-3.6-flash',
+      responseId: 'recovered-response',
+    },
+  ];
+
+  global.fetch = async (request) => {
+    requestBodies.push(JSON.parse(await request.clone().text()));
+    return new Response(JSON.stringify(responses[requestBodies.length - 1]), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const model = new GeminiChatModel(
+      {
+        apiKey: 'test',
+        model: 'gemini-3.6-flash',
+      },
+      (usage) => reportedUsage.push(usage),
+    );
+    const response = await model.invoke([
+      new N8n2326HumanMessage('Conclua a tarefa depois das ferramentas'),
+    ]);
+
+    assert.equal(response.text, 'Resposta final recuperada.');
+    assert.equal(requestBodies.length, 2);
+    assert.match(
+      JSON.stringify(requestBodies[1]),
+      /previous model turn ended with STOP/,
+    );
+    assert.deepEqual(response.response_metadata.gemini.emptyResponseRecovery, {
+      attempted: true,
+      providerRequests: 2,
+      emptyResponses: 1,
+      responseIds: ['empty-response', 'recovered-response'],
+    });
+    assert.equal(
+      response.response_metadata.gemini.usageMetadata.promptTokenCount,
+      34086,
+    );
+    assert.equal(
+      response.response_metadata.gemini.usageMetadata.candidatesTokenCount,
+      8,
+    );
+    assert.equal(
+      response.response_metadata.gemini.usageMetadata.thoughtsTokenCount,
+      16,
+    );
+    assert.equal(
+      response.response_metadata.gemini.usageMetadata.totalTokenCount,
+      34110,
+    );
+    assert.equal(response.usage_metadata.input_tokens, 34086);
+    assert.equal(response.usage_metadata.output_tokens, 24);
+    assert.equal(response.usage_metadata.total_tokens, 34110);
+    assert.equal(reportedUsage.length, 1);
+    assert.equal(reportedUsage[0].totalTokenCount, 34110);
+    assert.deepEqual(reportedUsage[0].promptTokensDetails, [
+      { modality: 'TEXT', tokenCount: 34086 },
+    ]);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Gemini never treats a blank structured function call as an empty response', async () => {
+  const originalFetch = global.fetch;
+  let requests = 0;
+  global.fetch = async () => {
+    requests += 1;
+    return new Response(
+      JSON.stringify({
+        candidates: [
+          {
+            content: {
+              role: 'model',
+              parts: [
+                {
+                  functionCall: {
+                    id: 'call-once',
+                    name: 'lookup_order',
+                    args: { orderId: '123' },
+                  },
+                  thoughtSignature: 'signature-call-once',
+                },
+              ],
+            },
+            finishReason: 'STOP',
+            finishMessage: 'Model generated function call(s).',
+            index: 0,
+          },
+        ],
+        usageMetadata,
+        modelVersion: 'gemini-3.6-flash',
+        responseId: 'tool-response',
+      }),
+      {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      },
+    );
+  };
+
+  try {
+    const model = new GeminiChatModel({
+      apiKey: 'test',
+      model: 'gemini-3.6-flash',
+    }).bindTools([
+      {
+        functionDeclarations: [
+          {
+            name: 'lookup_order',
+            description: 'Look up an order',
+            parameters: {
+              type: 'object',
+              properties: { orderId: { type: 'string' } },
+              required: ['orderId'],
+            },
+          },
+        ],
+      },
+    ]);
+    const response = await model.invoke('Consulte o pedido');
+
+    assert.equal(response.text, '');
+    assert.equal(response.tool_calls.length, 1);
+    assert.equal(response.tool_calls[0].id, 'call-once');
+    assert.equal(requests, 1);
+    assert.equal(
+      response.response_metadata.gemini.emptyResponseRecovery,
+      undefined,
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Gemini raises a detailed error instead of returning blank after recovery also ends empty', async () => {
+  const originalFetch = global.fetch;
+  let requests = 0;
+  global.fetch = async () => {
+    requests += 1;
+    return new Response(
+      JSON.stringify({
+        candidates: [
+          {
+            content: { role: 'model', parts: [] },
+            finishReason: 'STOP',
+            index: 0,
+          },
+        ],
+        usageMetadata: {
+          promptTokenCount: 25,
+          totalTokenCount: 25,
+        },
+        modelVersion: 'gemini-3.6-flash',
+        responseId: `empty-${requests}`,
+      }),
+      {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      },
+    );
+  };
+
+  try {
+    const model = new GeminiChatModel({
+      apiKey: 'test',
+      model: 'gemini-3.6-flash',
+    });
+
+    await assert.rejects(
+      () => model.invoke('Finalize'),
+      (error) => {
+        assert.equal(error.name, 'NoCandidatesError');
+        assert.match(error.message, /after one automatic recovery attempt/);
+        assert.deepEqual(error.finishReasons, ['STOP']);
+        assert.equal(error.emptyResponseRecoveryAttempted, true);
+        return true;
+      },
+    );
+    assert.equal(requests, 2);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Gemini does not retry an empty response blocked by a candidate safety finish reason', async () => {
+  const originalFetch = global.fetch;
+  let requests = 0;
+  global.fetch = async () => {
+    requests += 1;
+    return new Response(
+      JSON.stringify({
+        candidates: [
+          {
+            content: { role: 'model', parts: [] },
+            finishReason: 'SAFETY',
+            finishMessage: 'Candidate was blocked by safety filters.',
+            index: 0,
+          },
+        ],
+        usageMetadata: {
+          promptTokenCount: 12,
+          totalTokenCount: 12,
+        },
+        modelVersion: 'gemini-3.6-flash',
+        responseId: 'blocked-response',
+      }),
+      {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      },
+    );
+  };
+
+  try {
+    const model = new GeminiChatModel({
+      apiKey: 'test',
+      model: 'gemini-3.6-flash',
+    });
+    await assert.rejects(
+      () => model.invoke('Conteudo potencialmente bloqueado'),
+      (error) => {
+        assert.equal(error.name, 'PromptBlockedError');
+        assert.match(error.message, /SAFETY/);
+        return true;
+      },
+    );
+    assert.equal(requests, 1);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Gemini completes a multi-tool agent loop when the terminal call is initially empty', async () => {
+  const originalFetch = global.fetch;
+  const requestBodies = [];
+  const toolNames = ['first_tool', 'second_tool', 'third_tool'];
+  const responses = [
+    ...toolNames.map((name, index) => ({
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: [
+              {
+                functionCall: {
+                  id: `call-${index + 1}`,
+                  name,
+                  args: { step: index + 1 },
+                },
+                thoughtSignature: `signature-${index + 1}`,
+              },
+            ],
+          },
+          finishReason: 'STOP',
+          finishMessage: 'Model generated function call(s).',
+          index: 0,
+        },
+      ],
+      usageMetadata: {
+        promptTokenCount: 100 + index,
+        candidatesTokenCount: 5,
+        totalTokenCount: 105 + index,
+      },
+      modelVersion: 'gemini-3.6-flash',
+      responseId: `tool-${index + 1}`,
+    })),
+    {
+      candidates: [
+        {
+          content: { role: 'model', parts: [] },
+          finishReason: 'STOP',
+          index: 0,
+        },
+      ],
+      usageMetadata: {
+        promptTokenCount: 17000,
+        totalTokenCount: 17000,
+      },
+      modelVersion: 'gemini-3.6-flash',
+      responseId: 'terminal-empty',
+    },
+    {
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: [{ text: 'Todas as ferramentas foram concluídas.' }],
+          },
+          finishReason: 'STOP',
+          index: 0,
+        },
+      ],
+      usageMetadata: {
+        promptTokenCount: 17040,
+        candidatesTokenCount: 9,
+        totalTokenCount: 17049,
+      },
+      modelVersion: 'gemini-3.6-flash',
+      responseId: 'terminal-recovered',
+    },
+  ];
+
+  global.fetch = async (request) => {
+    requestBodies.push(JSON.parse(await request.clone().text()));
+    return new Response(JSON.stringify(responses[requestBodies.length - 1]), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const model = new GeminiChatModel({
+      apiKey: 'test',
+      model: 'gemini-3.6-flash',
+    }).bindTools([
+      {
+        functionDeclarations: toolNames.map((name) => ({
+          name,
+          description: `Execute ${name}`,
+          parameters: {
+            type: 'object',
+            properties: { step: { type: 'number' } },
+            required: ['step'],
+          },
+        })),
+      },
+    ]);
+    const history = [
+      new N8n2326HumanMessage('Execute as três ferramentas e responda'),
+    ];
+    const emittedToolNames = [];
+
+    for (let index = 0; index < toolNames.length; index += 1) {
+      const callMessage = await model.invoke(history);
+      assert.equal(callMessage.text, '');
+      assert.equal(callMessage.tool_calls.length, 1);
+      emittedToolNames.push(callMessage.tool_calls[0].name);
+      history.push(callMessage);
+      history.push(
+        new N8n2326ToolMessage({
+          content: JSON.stringify({ ok: true, step: index + 1 }),
+          tool_call_id: `call-${index + 1}`,
+          name: toolNames[index],
+        }),
+      );
+    }
+
+    const final = await model.invoke(history);
+    assert.equal(final.text, 'Todas as ferramentas foram concluídas.');
+    assert.deepEqual(emittedToolNames, toolNames);
+    assert.equal(requestBodies.length, 5);
+    assert.equal(
+      final.response_metadata.gemini.emptyResponseRecovery.providerRequests,
+      2,
+    );
+    assert.equal(
+      final.response_metadata.gemini.usageMetadata.promptTokenCount,
+      34040,
+    );
+
+    const recoveryBody = requestBodies[4];
+    assert.deepEqual(recoveryBody.toolConfig, {
+      functionCallingConfig: { mode: 'NONE' },
+    });
+    const recoveryCalls = recoveryBody.contents
+      .filter((content) => content.role === 'model')
+      .flatMap((content) => content.parts)
+      .filter((part) => part.functionCall)
+      .map((part) => part.functionCall.name);
+    assert.deepEqual(recoveryCalls, toolNames);
+    assert.match(
+      JSON.stringify(recoveryBody),
+      /Function calling is disabled for this recovery turn/,
     );
   } finally {
     global.fetch = originalFetch;
@@ -2088,7 +2555,7 @@ test('Gemini agent tool loop preserves parallel calls and matches every tool res
         ],
       },
     ]);
-    const human = new N8n225HumanMessage('Consulte preço e entrega');
+    const human = new N8n2326HumanMessage('Consulte preço e entrega');
     const calls = await model.invoke([human]);
 
     assert.deepEqual(
@@ -2111,12 +2578,12 @@ test('Gemini agent tool loop preserves parallel calls and matches every tool res
       ],
     );
 
-    const price = new N8n225ToolMessage({
+    const price = new N8n2326ToolMessage({
       content: JSON.stringify({ price: 1000 }),
       tool_call_id: 'call-price',
       name: 'get_price',
     });
-    const delivery = new N8n225ToolMessage({
+    const delivery = new N8n2326ToolMessage({
       content: JSON.stringify({ days: 3 }),
       tool_call_id: 'call-delivery',
       name: 'get_delivery',
@@ -2152,7 +2619,7 @@ test('Gemini agent tool loop preserves parallel calls and matches every tool res
   }
 });
 
-test('Gemini streaming interoperates with n8n 2.2.5 and keeps final usage metadata', async () => {
+test('Gemini streaming interoperates with n8n 2.32.6 and keeps final usage metadata', async () => {
   const originalFetch = global.fetch;
   const event = `data: ${JSON.stringify(makeGeminiResponse())}\n\n`;
   global.fetch = async () =>
@@ -2169,7 +2636,7 @@ test('Gemini streaming interoperates with n8n 2.2.5 and keeps final usage metada
     });
     const chunks = [];
     const stream = await model.stream([
-      new N8n225HumanMessage('stream criado pelo LangChain do n8n 2.2.5'),
+      new N8n2326HumanMessage('stream criado pelo LangChain do n8n 2.32.6'),
     ]);
     for await (const chunk of stream) {
       chunks.push(chunk);
@@ -2177,7 +2644,7 @@ test('Gemini streaming interoperates with n8n 2.2.5 and keeps final usage metada
 
     const chunkWithUsage = chunks.find((chunk) => chunk.response_metadata?.gemini);
     assert.ok(chunkWithUsage);
-    assert.equal(isN8n225AIMessage(chunkWithUsage), true);
+    assert.equal(isN8n2326AIMessage(chunkWithUsage), true);
     assert.equal(
       chunks.some((chunk) =>
         Array.isArray(chunk.content)
@@ -2190,6 +2657,112 @@ test('Gemini streaming interoperates with n8n 2.2.5 and keeps final usage metada
     assert.deepEqual(chunkWithUsage.response_metadata.gemini.usageMetadata, usageMetadata);
     assert.equal(chunkWithUsage.usage_metadata.input_token_details.tool_use, 7);
     assert.equal(chunkWithUsage.usage_metadata.output_token_details.reasoning, 13);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Gemini streaming recovers an empty STOP before emitting output and preserves aggregate usage', async () => {
+  const originalFetch = global.fetch;
+  const requestBodies = [];
+  const events = [
+    {
+      candidates: [
+        {
+          content: { role: 'model', parts: [] },
+          finishReason: 'STOP',
+          index: 0,
+        },
+      ],
+      usageMetadata: {
+        promptTokenCount: 100,
+        totalTokenCount: 100,
+        promptTokensDetails: [{ modality: 'TEXT', tokenCount: 100 }],
+      },
+      modelVersion: 'gemini-3.6-flash',
+      responseId: 'stream-empty',
+    },
+    {
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: [{ text: 'Resposta recuperada no stream.' }],
+          },
+          finishReason: 'STOP',
+          index: 0,
+        },
+      ],
+      usageMetadata: {
+        promptTokenCount: 120,
+        candidatesTokenCount: 7,
+        totalTokenCount: 127,
+        promptTokensDetails: [{ modality: 'TEXT', tokenCount: 120 }],
+        candidatesTokensDetails: [{ modality: 'TEXT', tokenCount: 7 }],
+      },
+      modelVersion: 'gemini-3.6-flash',
+      responseId: 'stream-recovered',
+    },
+  ];
+  global.fetch = async (request) => {
+    requestBodies.push(JSON.parse(await request.clone().text()));
+    const event = events[requestBodies.length - 1];
+    return new Response(`data: ${JSON.stringify(event)}\n\n`, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  };
+
+  try {
+    const model = new GeminiChatModel({
+      apiKey: 'test',
+      model: 'gemini-3.6-flash',
+    });
+    const chunks = [];
+    const stream = await model.stream('Finalize a tarefa');
+    for await (const chunk of stream) chunks.push(chunk);
+
+    assert.equal(requestBodies.length, 2);
+    assert.match(
+      JSON.stringify(requestBodies[1]),
+      /previous model turn ended with STOP/,
+    );
+    assert.equal(
+      chunks
+        .map((chunk) =>
+          typeof chunk.content === 'string'
+            ? chunk.content
+            : Array.isArray(chunk.content)
+              ? chunk.content.map((block) => block?.text ?? '').join('')
+              : '',
+        )
+        .join(''),
+      'Resposta recuperada no stream.',
+    );
+    const metadataChunk = chunks.find(
+      (chunk) => chunk.response_metadata?.gemini?.emptyResponseRecovery,
+    );
+    assert.ok(metadataChunk);
+    assert.deepEqual(
+      metadataChunk.response_metadata.gemini.emptyResponseRecovery,
+      {
+        attempted: true,
+        providerRequests: 2,
+        emptyResponses: 1,
+        responseIds: ['stream-empty', 'stream-recovered'],
+      },
+    );
+    assert.equal(
+      metadataChunk.response_metadata.gemini.usageMetadata.promptTokenCount,
+      220,
+    );
+    assert.equal(
+      metadataChunk.response_metadata.gemini.usageMetadata.totalTokenCount,
+      227,
+    );
+    assert.equal(metadataChunk.usage_metadata.input_tokens, 220);
+    assert.equal(metadataChunk.usage_metadata.output_tokens, 7);
+    assert.equal(metadataChunk.usage_metadata.total_tokens, 227);
   } finally {
     global.fetch = originalFetch;
   }
