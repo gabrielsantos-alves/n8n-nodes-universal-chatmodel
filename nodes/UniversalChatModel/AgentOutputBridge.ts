@@ -11,6 +11,7 @@ export interface AgentModelCallMetadata {
   thoughts?: unknown[];
   tokenUsage?: IDataObject;
   includeTokenUsageInAgentOutput?: boolean;
+  includeIntermediateStepsInOutput?: boolean;
   usageMetadata?: IDataObject;
   gemini?: IDataObject;
   structuredOutput?: IDataObject;
@@ -52,6 +53,46 @@ function asRecord(value: unknown): Record<string, any> | undefined {
   return value !== null && typeof value === 'object'
     ? (value as Record<string, any>)
     : undefined;
+}
+
+/**
+ * n8n's Agent can expose LangChain's complete AIMessage under
+ * intermediateSteps[].action.messageLog. That message is required while the
+ * tool loop is running, but it contains transport-only fields (including
+ * Gemini thought signatures) that must not leak into the final workflow item.
+ *
+ * This only edits the already-finished public result. The engine request and
+ * the AIMessage used by the next Gemini call keep their original metadata.
+ */
+function sanitizePublicIntermediateSteps(
+  json: Record<string, any>,
+  includeIntermediateSteps: boolean,
+): void {
+  if (!Array.isArray(json.intermediateSteps)) return;
+
+  if (!includeIntermediateSteps) {
+    delete json.intermediateSteps;
+    return;
+  }
+
+  json.intermediateSteps = json.intermediateSteps.map((step: unknown) => {
+    const stepRecord = asRecord(step);
+    if (!stepRecord) return step;
+
+    const sanitizedStep = { ...stepRecord };
+    delete sanitizedStep.messageLog;
+    delete sanitizedStep.message_log;
+
+    const action = asRecord(stepRecord.action);
+    if (action) {
+      const sanitizedAction = { ...action };
+      delete sanitizedAction.messageLog;
+      delete sanitizedAction.message_log;
+      sanitizedStep.action = sanitizedAction;
+    }
+
+    return sanitizedStep;
+  });
 }
 
 function mergeThoughts(calls: AgentModelCallMetadata[]): unknown[] {
@@ -106,7 +147,7 @@ function buildAgentOutputMetadata(
   const thoughts = mergeThoughts(calls);
   const lastCall = calls[calls.length - 1];
   const callsWithVisibleUsage = calls.filter(
-    (call) => call.includeTokenUsageInAgentOutput !== false,
+    (call) => call.includeTokenUsageInAgentOutput === true,
   );
   const lastCallWithVisibleUsage =
     callsWithVisibleUsage[callsWithVisibleUsage.length - 1];
@@ -115,10 +156,10 @@ function buildAgentOutputMetadata(
     ...(call.thoughts?.length
       ? { thoughts: cloneValue(call.thoughts) }
       : {}),
-    ...(call.includeTokenUsageInAgentOutput !== false && call.tokenUsage
+    ...(call.includeTokenUsageInAgentOutput === true && call.tokenUsage
       ? { tokenUsage: cloneValue(call.tokenUsage) }
       : {}),
-    ...(call.includeTokenUsageInAgentOutput !== false && call.usageMetadata
+    ...(call.includeTokenUsageInAgentOutput === true && call.usageMetadata
       ? { usageMetadata: cloneValue(call.usageMetadata) }
       : {}),
     ...(call.gemini ? { gemini: cloneValue(call.gemini) } : {}),
@@ -181,6 +222,15 @@ function attachMetadataToAgentResult(
     const itemRecord = asRecord(item);
     const json = asRecord(itemRecord?.json);
     if (!json) continue;
+
+    // Do not affect Agents backed by another Chat Model. A non-empty capture
+    // proves that this execution actually passed through the Universal model.
+    if (calls.length > 0) {
+      sanitizePublicIntermediateSteps(
+        json,
+        calls[calls.length - 1]?.includeIntermediateStepsInOutput === true,
+      );
+    }
 
     // Prefer the final value produced by the Agent/output parser. The captured
     // model value is a fallback for Agent versions that only return text.

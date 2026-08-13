@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { ChatGoogle } from '@langchain/google/node';
+import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { HumanMessage, type BaseMessage } from '@langchain/core/messages';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatGenerationChunk, ChatResult } from '@langchain/core/outputs';
@@ -30,6 +30,7 @@ export interface GeminiResponseMetadata {
   modelStatus?: unknown;
   promptFeedback?: unknown;
   thoughts?: unknown[];
+  functionCalls?: unknown[];
   [key: string]: unknown;
 }
 
@@ -39,6 +40,10 @@ interface CaptureContext {
   finishMessages: string[];
   hasFunctionCall: boolean;
   hasNonThoughtOutput: boolean;
+  functionCalls: unknown[];
+  providerRequestMs: number;
+  metadataCaptureMs: number;
+  adapterTotalMs: number;
 }
 
 const responseCapture = new AsyncLocalStorage<CaptureContext>();
@@ -69,7 +74,29 @@ function normalizeRawThoughtPart(part: unknown): unknown[] {
     record.type === 'thinking' ||
     record.type === 'reasoning'
   ) {
-    return [structuredClone(record)];
+    const text =
+      typeof record.text === 'string'
+        ? record.text
+        : typeof record.thinking === 'string'
+          ? record.thinking
+          : typeof record.reasoning === 'string'
+            ? record.reasoning
+            : undefined;
+    const signature =
+      typeof record.thoughtSignature === 'string'
+        ? record.thoughtSignature
+        : typeof record.signature === 'string'
+          ? record.signature
+          : undefined;
+    return text
+      ? [
+          {
+            text,
+            thought: true,
+            ...(signature ? { thoughtSignature: signature } : {}),
+          },
+        ]
+      : [structuredClone(record)];
   }
 
   // Newer Gemini response schemas may represent a thought as a nested object
@@ -141,6 +168,30 @@ function extractRawThoughts(payload: unknown): unknown[] {
   return mergeUniqueThoughts([], thoughts);
 }
 
+function mergeUniqueFunctionCalls(existing: unknown, incoming: unknown[]): unknown[] {
+  const calls = [...(Array.isArray(existing) ? existing : []), ...incoming];
+  const seen = new Set<string>();
+
+  return calls.filter((call) => {
+    const record = asRecord(call);
+    const functionCall =
+      asRecord(record?.functionCall) ??
+      asRecord(record?.function_call) ??
+      record;
+    if (!functionCall || typeof functionCall.name !== 'string') return false;
+    const key =
+      typeof functionCall.id === 'string' && functionCall.id.length > 0
+        ? `id:${functionCall.id}`
+        : JSON.stringify({
+            name: functionCall.name,
+            args: functionCall.args ?? functionCall.arguments,
+          });
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function capturePayload(payload: unknown): void {
   if (!payload || typeof payload !== 'object') return;
 
@@ -165,9 +216,15 @@ function capturePayload(payload: unknown): void {
     for (const partValue of parts) {
       const part = asRecord(partValue);
       if (!part) continue;
-      if (asRecord(part.functionCall) || asRecord(part.function_call)) {
+      const functionCall =
+        asRecord(part.functionCall) ?? asRecord(part.function_call);
+      if (functionCall) {
         context.hasFunctionCall = true;
         context.hasNonThoughtOutput = true;
+        context.functionCalls.push({
+          type: 'functionCall',
+          functionCall: structuredClone(functionCall),
+        });
         continue;
       }
       if (isThoughtBlock(part)) continue;
@@ -202,6 +259,14 @@ function capturePayload(payload: unknown): void {
           ),
         }
       : {}),
+    ...(context.functionCalls.length > 0
+      ? {
+          functionCalls: mergeUniqueFunctionCalls(
+            previous.functionCalls,
+            context.functionCalls,
+          ),
+        }
+      : {}),
   };
 }
 
@@ -211,87 +276,67 @@ function createCaptureContext(): CaptureContext {
     finishMessages: [],
     hasFunctionCall: false,
     hasNonThoughtOutput: false,
+    functionCalls: [],
+    providerRequestMs: 0,
+    metadataCaptureMs: 0,
+    adapterTotalMs: 0,
   };
 }
 
-function consumeSseText(context: CaptureContext, state: { buffer: string }, text: string): void {
-  state.buffer += text;
-
-  while (true) {
-    const separator = state.buffer.search(/\r?\n\r?\n/);
-    if (separator < 0) break;
-
-    const event = state.buffer.slice(0, separator);
-    const separatorMatch = state.buffer.slice(separator).match(/^\r?\n\r?\n/);
-    state.buffer = state.buffer.slice(separator + (separatorMatch?.[0].length ?? 2));
-
-    const data = event
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith('data:'))
-      .map((line) => line.slice(5).trimStart())
-      .join('\n');
-
-    if (!data || data === '[DONE]') continue;
-
-    try {
-      responseCapture.run(context, () => capturePayload(JSON.parse(data)));
-    } catch {
-      // Ignore incomplete/non-JSON SSE events. The LangChain parser handles API errors.
-    }
-  }
+function requestTimeoutError(timeoutMs: number, cause?: unknown): Error {
+  const error = new Error(
+    `Gemini model request timed out after ${timeoutMs} ms.`,
+    cause === undefined ? undefined : { cause },
+  );
+  error.name = 'ModelRequestTimeoutError';
+  Object.assign(error, {
+    code: 'ETIMEDOUT',
+    timeoutMs,
+  });
+  return error;
 }
 
-class CapturingGeminiApiClient {
-  constructor(private readonly apiKey: string) {}
-
-  hasApiKey(): boolean {
-    return this.apiKey.length > 0;
+function timedRequestOptions(
+  requestOptions: unknown,
+  timeoutMs: number,
+): {
+  options: Record<string, unknown>;
+  didTimeout: () => boolean;
+  cleanup: () => void;
+} {
+  const options = asRecord(requestOptions) ?? {};
+  if (timeoutMs <= 0) {
+    return {
+      options,
+      didTimeout: () => false,
+      cleanup: () => undefined,
+    };
   }
 
-  async getProjectId(): Promise<string> {
-    return '';
-  }
+  const controller = new AbortController();
+  const parentSignal = options.signal as AbortSignal | undefined;
+  let timedOut = false;
+  const abortFromParent = () => controller.abort(parentSignal?.reason);
 
-  async fetch(request: Request): Promise<Response> {
-    request.headers.set('x-goog-api-key', this.apiKey);
-    const context = responseCapture.getStore();
-    const response = await fetch(request);
+  if (parentSignal?.aborted) abortFromParent();
+  else parentSignal?.addEventListener('abort', abortFromParent, { once: true });
 
-    if (!context || !response.ok) return response;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(requestTimeoutError(timeoutMs));
+  }, timeoutMs);
 
-    const contentType = response.headers.get('content-type') ?? '';
-    if (!contentType.includes('text/event-stream') || !response.body) {
-      try {
-        capturePayload(await response.clone().json());
-      } catch {
-        // Leave parsing and error reporting to LangChain.
-      }
-      return response;
-    }
-
-    const decoder = new TextDecoder();
-    const state = { buffer: '' };
-    const body = response.body.pipeThrough(
-      new TransformStream<Uint8Array, Uint8Array>({
-        transform(chunk, controller) {
-          consumeSseText(context, state, decoder.decode(chunk, { stream: true }));
-          controller.enqueue(chunk);
-        },
-        flush() {
-          consumeSseText(context, state, decoder.decode());
-          if (state.buffer.trim()) {
-            consumeSseText(context, state, '\n\n');
-          }
-        },
-      }),
-    );
-
-    return new Response(body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers,
-    });
-  }
+  return {
+    options: {
+      ...options,
+      signal: controller.signal,
+    },
+    didTimeout: () => timedOut,
+    cleanup: () => {
+      clearTimeout(timer);
+      parentSignal?.removeEventListener('abort', abortFromParent);
+    },
+  };
 }
 
 function isThoughtBlock(block: unknown): boolean {
@@ -572,11 +617,43 @@ function mergeResponseMetadata(
       Array.isArray(response.thoughts) ? response.thoughts : [],
     ),
   );
+  const functionCalls = mergeUniqueFunctionCalls(
+    [],
+    responses.flatMap((response) =>
+      Array.isArray(response.functionCalls) ? response.functionCalls : [],
+    ),
+  );
   const usageMetadata = mergeUsageMetadata(responses);
+  const providerRequestMs = contexts.reduce(
+    (total, context) => total + context.providerRequestMs,
+    0,
+  );
+  const metadataCaptureMs = contexts.reduce(
+    (total, context) => total + context.metadataCaptureMs,
+    0,
+  );
+  const adapterTotalMs = contexts.reduce(
+    (total, context) => total + context.adapterTotalMs,
+    0,
+  );
   const merged: GeminiResponseMetadata = {
     ...structuredClone(responses.at(-1)!),
     ...(usageMetadata ? { usageMetadata } : {}),
     ...(thoughts.length > 0 ? { thoughts } : {}),
+    ...(functionCalls.length > 0 ? { functionCalls } : {}),
+    ...(adapterTotalMs > 0
+      ? {
+          clientTiming: {
+            providerRequestMs,
+            metadataCaptureMs,
+            adapterOverheadMs: Math.max(
+              adapterTotalMs - providerRequestMs - metadataCaptureMs,
+              0,
+            ),
+            totalAdapterMs: adapterTotalMs,
+          },
+        }
+      : {}),
   };
 
   if (contexts.length > 1) {
@@ -707,6 +784,21 @@ function augmentMessage(
     gemini,
   };
 
+  // The official adapter keeps Gemini thought signatures in this map so an
+  // AI Agent can reconstruct the next tool turn correctly. Keep that native
+  // representation and also expose the signature on each tool call for
+  // backward compatibility with existing Universal Chat Model workflows.
+  const signatures =
+    message.additional_kwargs?.__gemini_function_call_thought_signatures__;
+  if (signatures && Array.isArray(message.tool_calls)) {
+    message.tool_calls = message.tool_calls.map((toolCall: any) => ({
+      ...toolCall,
+      ...(toolCall?.id && typeof signatures[toolCall.id] === 'string'
+        ? { thoughtSignature: signatures[toolCall.id] }
+        : {}),
+    }));
+  }
+
 }
 
 function augmentChatResult(
@@ -759,20 +851,19 @@ export function formatGeminiUsage(metadata: GeminiUsageMetadata): string {
     .join(' | ')}`;
 }
 
-export class GeminiChatModel extends ChatGoogle {
+export class GeminiChatModel extends ChatGoogleGenerativeAI {
   private readonly onUsage?: (metadata: GeminiUsageMetadata) => void;
   private readonly explicitThinkingConfig?: Record<string, unknown>;
   private readonly explicitResponseMimeType?: string;
+  private readonly explicitResponseSchema?: Record<string, unknown>;
   private readonly includeThoughts: boolean;
   private readonly recoverEmptyResponses: boolean;
+  private readonly requestTimeoutMs: number;
 
   constructor(fields: Record<string, unknown>, onUsage?: (metadata: GeminiUsageMetadata) => void) {
-    const apiKey = String(fields.apiKey ?? '');
     super({
       ...fields,
       model: String(fields.model ?? ''),
-      apiKey,
-      apiClient: new CapturingGeminiApiClient(apiKey) as any,
     } as any);
     this.onUsage = onUsage;
     this.explicitThinkingConfig =
@@ -781,21 +872,120 @@ export class GeminiChatModel extends ChatGoogle {
         : undefined;
     this.includeThoughts = this.explicitThinkingConfig?.includeThoughts === true;
     this.recoverEmptyResponses = fields.recoverEmptyResponses !== false;
+    const configuredTimeout = Number(fields.requestTimeoutMs ?? 60_000);
+    this.requestTimeoutMs = Number.isFinite(configuredTimeout)
+      ? Math.max(0, Math.min(900_000, Math.trunc(configuredTimeout)))
+      : 60_000;
     this.explicitResponseMimeType =
       typeof fields.responseMimeType === 'string' ? fields.responseMimeType : undefined;
+    this.explicitResponseSchema =
+      fields.responseSchema && typeof fields.responseSchema === 'object'
+        ? (fields.responseSchema as Record<string, unknown>)
+        : undefined;
+
+    // Capture raw metadata while retaining the same official Google client
+    // used by n8n's native Gemini Chat Model. Replacing the transport breaks
+    // reconstruction of model/function-call/function-response histories.
+    const client = (this as any).client;
+    if (client && typeof client.generateContent === 'function') {
+      const generateContent = client.generateContent.bind(client);
+      client.generateContent = async (...args: unknown[]) => {
+        const request = timedRequestOptions(args[1], this.requestTimeoutMs);
+        const startedAt = Date.now();
+        try {
+          const result = await generateContent(args[0], request.options);
+          const context = responseCapture.getStore();
+          if (context) context.providerRequestMs += Date.now() - startedAt;
+          const captureStartedAt = Date.now();
+          capturePayload(result?.response);
+          if (context) context.metadataCaptureMs += Date.now() - captureStartedAt;
+          return result;
+        } catch (error) {
+          if (request.didTimeout()) {
+            throw requestTimeoutError(this.requestTimeoutMs, error);
+          }
+          throw error;
+        } finally {
+          request.cleanup();
+        }
+      };
+    }
+    if (client && typeof client.generateContentStream === 'function') {
+      const generateContentStream = client.generateContentStream.bind(client);
+      client.generateContentStream = async (...args: unknown[]) => {
+        const requestTimeoutMs = this.requestTimeoutMs;
+        const request = timedRequestOptions(args[1], requestTimeoutMs);
+        const startedAt = Date.now();
+        let result: any;
+        try {
+          result = await generateContentStream(args[0], request.options);
+        } catch (error) {
+          request.cleanup();
+          if (request.didTimeout()) {
+            throw requestTimeoutError(requestTimeoutMs, error);
+          }
+          throw error;
+        }
+        const context = responseCapture.getStore();
+        if (!result?.stream) {
+          request.cleanup();
+          return result;
+        }
+        const originalStream = result.stream as AsyncIterable<unknown>;
+        return {
+          ...result,
+          stream: {
+            async *[Symbol.asyncIterator]() {
+              try {
+                for await (const response of originalStream) {
+                  const captureStartedAt = Date.now();
+                  if (context) {
+                    responseCapture.run(context, () => capturePayload(response));
+                    context.metadataCaptureMs += Date.now() - captureStartedAt;
+                  }
+                  yield response;
+                }
+                if (context) context.providerRequestMs += Date.now() - startedAt;
+              } catch (error) {
+                if (request.didTimeout()) {
+                  throw requestTimeoutError(requestTimeoutMs, error);
+                }
+                throw error;
+              } finally {
+                request.cleanup();
+              }
+            },
+          },
+        };
+      };
+    }
   }
 
   override invocationParams(options: this['ParsedCallOptions']): any {
     const params = super.invocationParams(options) as any;
+    const generationConfig = (this as any).client?.generationConfig;
 
-    if (this.explicitThinkingConfig && Object.keys(this.explicitThinkingConfig).length > 0) {
-      params.generationConfig.thinkingConfig = this.explicitThinkingConfig;
-    }
-    if (this.explicitResponseMimeType) {
-      params.generationConfig.responseMimeType = this.explicitResponseMimeType;
+    if (generationConfig) {
+      if (
+        this.explicitThinkingConfig &&
+        Object.keys(this.explicitThinkingConfig).length > 0
+      ) {
+        generationConfig.thinkingConfig = this.explicitThinkingConfig;
+      }
+      if (this.explicitResponseSchema) {
+        generationConfig.responseSchema = this.explicitResponseSchema;
+        generationConfig.responseMimeType = 'application/json';
+      } else if (this.explicitResponseMimeType) {
+        generationConfig.responseMimeType = this.explicitResponseMimeType;
+      }
     }
 
-    return params;
+    return {
+      ...params,
+      ...(generationConfig
+        ? { generationConfig: { ...generationConfig } }
+        : {}),
+    };
   }
 
   override async _generate(
@@ -808,9 +998,11 @@ export class GeminiChatModel extends ChatGoogle {
       attemptOptions: this['ParsedCallOptions'] = options,
     ) => {
       const context = createCaptureContext();
+      const adapterStartedAt = Date.now();
       const result = await responseCapture.run(context, () =>
         super._generate(attemptMessages, attemptOptions, runManager),
       );
+      context.adapterTotalMs += Date.now() - adapterStartedAt;
       return { result, context };
     };
 

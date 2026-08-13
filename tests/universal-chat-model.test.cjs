@@ -24,6 +24,11 @@ const {
   recordAgentModelMetadata,
 } = require('../dist/nodes/UniversalChatModel/AgentOutputBridge.js');
 const {
+  extractObservableToolCalls,
+  observableGenerationText,
+} = require('../dist/nodes/UniversalChatModel/UniversalChatModelTracing.js');
+const {
+  AIMessage: N8n2326AIMessage,
   HumanMessage: N8n2326HumanMessage,
   ToolMessage: N8n2326ToolMessage,
   isAIMessage: isN8n2326AIMessage,
@@ -41,6 +46,18 @@ const {
   ChatGenerationChunk,
 } = require('@langchain/core/outputs');
 const { z } = require('zod');
+
+async function readFetchJson(request, init) {
+  if (request && typeof request.clone === 'function') {
+    return JSON.parse(await request.clone().text());
+  }
+  const body = init?.body;
+  if (typeof body === 'string') return JSON.parse(body);
+  if (body instanceof Uint8Array) {
+    return JSON.parse(new TextDecoder().decode(body));
+  }
+  throw new Error('The mocked request did not contain a readable JSON body.');
+}
 
 const usageMetadata = {
   promptTokenCount: 100,
@@ -89,7 +106,8 @@ test('package targets the runtime dependency set used by n8n 2.32.6', () => {
     'npm:@langchain/core@1.2.0',
   );
   assert.equal(packageJson.dependencies['@langchain/core'], '1.2.4');
-  assert.equal(packageJson.dependencies['@langchain/google'], '0.2.1');
+  assert.equal(packageJson.dependencies['@google/generative-ai'], '0.24.0');
+  assert.equal(packageJson.dependencies['@langchain/google-genai'], '2.1.24');
   assert.equal(packageJson.dependencies['@langchain/openai'], '1.5.5');
 });
 
@@ -111,10 +129,12 @@ test('Gemini generation controls are optional collection entries', () => {
       'thinkingLevel',
       'thinkingBudget',
       'includeThoughts',
+      'requestTimeoutMs',
       'recoverEmptyResponses',
       'safetySettings',
       'systemMessage',
       'includeTokenUsageInAgentOutput',
+      'includeIntermediateStepsInOutput',
       'usageReporter',
     ],
   );
@@ -166,6 +186,7 @@ test('Usage Reporter is an optional AI Tool input with configurable privacy cont
   const reportingNames = [
     'systemMessage',
     'includeTokenUsageInAgentOutput',
+    'includeIntermediateStepsInOutput',
     'usageReporter',
   ];
 
@@ -184,7 +205,12 @@ test('Usage Reporter is an optional AI Tool input with configurable privacy cont
       nested.includeTokenUsageInAgentOutput.displayName,
       'Include Token Usage in Output',
     );
-    assert.equal(nested.includeTokenUsageInAgentOutput.default, true);
+    assert.equal(nested.includeTokenUsageInAgentOutput.default, false);
+    assert.equal(
+      nested.includeIntermediateStepsInOutput.displayName,
+      'Include Intermediate Steps in Output',
+    );
+    assert.equal(nested.includeIntermediateStepsInOutput.default, false);
     assert.equal(nested.usageReporter.type, 'fixedCollection');
     const reporterValues = Object.fromEntries(
       nested.usageReporter.options[0].values.map((option) => [
@@ -198,6 +224,7 @@ test('Usage Reporter is an optional AI Tool input with configurable privacy cont
       'inputTextMode',
       'inputTextLabel',
       'includeOutputText',
+      'reporterMaxWaitMs',
       'failOnReporterError',
     ]);
     assert.equal(reporterValues.enabled.default, false);
@@ -205,7 +232,14 @@ test('Usage Reporter is an optional AI Tool input with configurable privacy cont
       enabled: [true],
     });
     assert.equal(reporterValues.inputTextMode.default, 'label');
+    assert.equal(
+      reporterValues.inputTextMode.options.find(
+        (option) => option.value === 'prompt',
+      ).name,
+      'Actual User Input',
+    );
     assert.equal(reporterValues.inputTextLabel.default, 'RAG');
+    assert.equal(reporterValues.reporterMaxWaitMs.default, 1000);
   }
 
   assert.deepEqual(
@@ -215,6 +249,7 @@ test('Usage Reporter is an optional AI Tool input with configurable privacy cont
         [
           'systemMessage',
           'includeTokenUsageInAgentOutput',
+          'includeIntermediateStepsInOutput',
           'enableUsageReporter',
           'usageReportingOptions',
         ].includes(name),
@@ -729,10 +764,7 @@ test('Retry On Fail does not retry a non-transient Gemini request error', async 
       outputs[0].data.context.modelError.category,
       'invalid_request',
     );
-    assert.equal(
-      outputs[0].data.context.modelError.requestId,
-      'request-no-retry',
-    );
+    assert.equal(outputs[0].data.context.modelError.status, 'INVALID_ARGUMENT');
   } finally {
     global.fetch = originalFetch;
   }
@@ -1239,7 +1271,7 @@ test('On Error Continue returns a model error message for custom and native n8n 
       {
         category: 'server',
         statusCode: 503,
-        status: undefined,
+        status: 'UNAVAILABLE',
         retryable: true,
         attempts: 1,
       },
@@ -1415,8 +1447,8 @@ test('Gemini request omits optional generation controls unless configured', () =
 test('node System Message is appended after the parent system prompt', async () => {
   const originalFetch = global.fetch;
   let requestBody;
-  global.fetch = async (request) => {
-    requestBody = JSON.parse(await request.clone().text());
+  global.fetch = async (request, init) => {
+    requestBody = await readFetchJson(request, init);
     return new Response(JSON.stringify(makeGeminiResponse()), {
       status: 200,
       headers: { 'content-type': 'application/json' },
@@ -1551,7 +1583,7 @@ test('Gemini Structured Output Schema is parsed and forces JSON responses', asyn
   const config = supplied.response.invocationParams({}).generationConfig;
 
   assert.equal(config.responseMimeType, 'application/json');
-  assert.deepEqual(config.responseJsonSchema, schema);
+  assert.deepEqual(config.responseSchema, schema);
 });
 
 test('Gemini Structured Output Schema rejects invalid JSON before making a request', async () => {
@@ -1673,8 +1705,8 @@ test('Gemini hides thought summaries unless Include Thoughts is enabled', async 
 
 test('concurrent Gemini requests keep raw thoughts and usage metadata isolated', async () => {
   const originalFetch = global.fetch;
-  global.fetch = async (request) => {
-    const body = JSON.parse(await request.clone().text());
+  global.fetch = async (request, init) => {
+    const body = await readFetchJson(request, init);
     const prompt = body.contents[0].parts[0].text;
     const isA = prompt === 'request-A';
     await new Promise((resolve) => setTimeout(resolve, isA ? 20 : 5));
@@ -1728,12 +1760,99 @@ test('concurrent Gemini requests keep raw thoughts and usage metadata isolated',
     assert.equal(responseA.response_metadata.gemini.modelVersion, 'model-A');
     assert.equal(responseA.usage_metadata.input_tokens, 10);
     assert.equal(responseA.usage_metadata.output_token_details.reasoning, 5);
+    assert.ok(
+      responseA.response_metadata.gemini.clientTiming.providerRequestMs >= 15,
+    );
+    assert.ok(
+      responseA.response_metadata.gemini.clientTiming.totalAdapterMs >=
+        responseA.response_metadata.gemini.clientTiming.providerRequestMs,
+    );
 
     assert.equal(responseB.text, 'Response B');
     assert.equal(responseB.response_metadata.thoughts[0].text, 'Thought B');
     assert.equal(responseB.response_metadata.gemini.modelVersion, 'model-B');
     assert.equal(responseB.usage_metadata.input_tokens, 100);
     assert.equal(responseB.usage_metadata.output_token_details.reasoning, 50);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Gemini request timeout is retryable and a second attempt can complete', async () => {
+  const originalFetch = global.fetch;
+  let attempts = 0;
+  global.fetch = async (request, init) => {
+    attempts += 1;
+    if (attempts === 1) {
+      return await new Promise((resolve, reject) => {
+        const signal = init?.signal ?? request?.signal;
+        const abort = () => reject(signal?.reason ?? new Error('aborted'));
+        if (signal?.aborted) abort();
+        else signal?.addEventListener('abort', abort, { once: true });
+      });
+    }
+
+    return new Response(JSON.stringify(makeGeminiResponse()), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const model = new GeminiChatModel({
+      apiKey: 'test',
+      model: 'gemini-3.5-flash-lite',
+      requestTimeoutMs: 15,
+      maxRetries: 0,
+    });
+    const retriedModel = applyModelRetry(
+      model,
+      {
+        alwaysOutputData: false,
+        executeOnce: false,
+        retryOnFail: true,
+        maxTries: 2,
+        waitBetweenTries: 0,
+        onError: 'stopWorkflow',
+      },
+      'gemini',
+    );
+
+    const response = await retriedModel.invoke('teste de timeout');
+    assert.equal(response.text, 'Resposta final');
+    assert.equal(attempts, 2);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Gemini request timeout reports a detailed timeout error when retry is disabled', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (request, init) =>
+    await new Promise((resolve, reject) => {
+      const signal = init?.signal ?? request?.signal;
+      const abort = () => reject(signal?.reason ?? new Error('aborted'));
+      if (signal?.aborted) abort();
+      else signal?.addEventListener('abort', abort, { once: true });
+    });
+
+  try {
+    const model = new GeminiChatModel({
+      apiKey: 'test',
+      model: 'gemini-3.5-flash-lite',
+      requestTimeoutMs: 15,
+      maxRetries: 0,
+    });
+
+    await assert.rejects(
+      () => model.invoke('teste de timeout sem retry'),
+      (error) => {
+        assert.equal(error.name, 'ModelRequestTimeoutError');
+        assert.equal(error.code, 'ETIMEDOUT');
+        assert.equal(error.timeoutMs, 15);
+        return true;
+      },
+    );
   } finally {
     global.fetch = originalFetch;
   }
@@ -1769,8 +1888,8 @@ test('Gemini model interoperates with LangChain 1.2 messages from n8n 2.32.6', a
 test('Gemini binds structured tools created by the LangChain version in n8n 2.32.6', async () => {
   const originalFetch = global.fetch;
   let requestBody;
-  global.fetch = async (request) => {
-    requestBody = JSON.parse(await request.clone().text());
+  global.fetch = async (request, init) => {
+    requestBody = await readFetchJson(request, init);
     return new Response(
       JSON.stringify({
         candidates: [
@@ -1840,7 +1959,7 @@ test('Gemini binds structured tools created by the LangChain version in n8n 2.32
       requestBody.generationConfig.responseMimeType,
       'application/json',
     );
-    assert.deepEqual(requestBody.generationConfig.responseJsonSchema, {
+    assert.deepEqual(requestBody.generationConfig.responseSchema, {
       type: 'object',
       properties: {
         message: { type: 'string' },
@@ -1850,6 +1969,125 @@ test('Gemini binds structured tools created by the LangChain version in n8n 2.32
   } finally {
     global.fetch = originalFetch;
   }
+});
+
+test('tool-call observability normalizes Gemini, LangChain, and OpenAI-compatible shapes', () => {
+  const query = 'status:active';
+  const generation = {
+    text: '',
+    message: {
+      content: [
+        {
+          type: 'functionCall',
+          functionCall: {
+            name: 'example_lookup',
+            args: { resourceId: 'resource-1' },
+            id: 'call-resource-1',
+          },
+        },
+      ],
+      tool_calls: [
+        {
+          name: 'example_lookup',
+          args: { resourceId: 'resource-1' },
+          id: 'call-resource-1',
+          type: 'tool_call',
+        },
+      ],
+      additional_kwargs: {
+        tool_calls: [
+          {
+            id: 'call-analytics-2',
+            type: 'function',
+            function: {
+              name: 'analytics_lookup',
+              arguments: JSON.stringify({
+                query,
+                datasetId: 'dataset-1',
+                id: 'call-analytics-2',
+              }),
+            },
+          },
+        ],
+      },
+    },
+  };
+  const expected = [
+    {
+      type: 'functionCall',
+      functionCall: {
+        name: 'example_lookup',
+        args: { resourceId: 'resource-1' },
+        id: 'call-resource-1',
+      },
+    },
+    {
+      type: 'functionCall',
+      functionCall: {
+        name: 'analytics_lookup',
+        args: {
+          query,
+          datasetId: 'dataset-1',
+          id: 'call-analytics-2',
+        },
+        id: 'call-analytics-2',
+      },
+    },
+  ];
+
+  assert.deepEqual(extractObservableToolCalls(generation), expected);
+  assert.equal(observableGenerationText(generation), JSON.stringify(expected));
+
+  const callbackWithoutToolFields = { text: '', message: { content: '' } };
+  assert.deepEqual(
+    extractObservableToolCalls(callbackWithoutToolFields, [
+      {
+        type: 'functionCall',
+        functionCall: {
+          name: 'FallbackTool',
+          args: { query: 'captured directly from Gemini' },
+          id: 'fallback-call',
+        },
+      },
+    ]),
+    [
+      {
+        type: 'functionCall',
+        functionCall: {
+          name: 'FallbackTool',
+          args: { query: 'captured directly from Gemini' },
+          id: 'fallback-call',
+        },
+      },
+    ],
+  );
+
+  assert.deepEqual(
+    extractObservableToolCalls({
+      text: '',
+      message: {
+        content: '',
+        tool_call_chunks: [
+          {
+            name: 'StreamingTool',
+            args: '{"value":42}',
+            id: 'streaming-call',
+            type: 'tool_call_chunk',
+          },
+        ],
+      },
+    }),
+    [
+      {
+        type: 'functionCall',
+        functionCall: {
+          name: 'StreamingTool',
+          args: { value: 42 },
+          id: 'streaming-call',
+        },
+      },
+    ],
+  );
 });
 
 test('Gemini agent tool loop preserves call IDs and thought signatures across sequential calls', async () => {
@@ -1921,8 +2159,8 @@ test('Gemini agent tool loop preserves call IDs and thought signatures across se
     },
   ];
 
-  global.fetch = async (request) => {
-    requestBodies.push(JSON.parse(await request.clone().text()));
+  global.fetch = async (request, init) => {
+    requestBodies.push(await readFetchJson(request, init));
     const response = responses[requestBodies.length - 1];
     return new Response(JSON.stringify(response), {
       status: 200,
@@ -1999,12 +2237,12 @@ test('Gemini agent tool loop preserves call IDs and thought signatures across se
     const secondRequest = requestBodies[1];
     const firstFunctionCall = secondRequest.contents
       .find((content) => content.role === 'model')
-      .parts.find((part) => part.functionCall?.id === 'call-search-1');
+      .parts.find((part) => part.functionCall?.name === 'search_catalog');
     assert.equal(firstFunctionCall.thoughtSignature, 'signature-search-1');
     const firstFunctionResponse = secondRequest.contents
       .find((content) =>
         content.parts.some(
-          (part) => part.functionResponse?.id === 'call-search-1',
+          (part) => part.functionResponse?.name === 'search_catalog',
         ),
       )
       .parts.find((part) => part.functionResponse);
@@ -2017,12 +2255,12 @@ test('Gemini agent tool loop preserves call IDs and thought signatures across se
       .filter((part) => part.functionCall);
     assert.deepEqual(
       modelCalls.map((part) => ({
-        id: part.functionCall.id,
+        name: part.functionCall.name,
         signature: part.thoughtSignature,
       })),
       [
-        { id: 'call-search-1', signature: 'signature-search-1' },
-        { id: 'call-stock-2', signature: 'signature-stock-2' },
+        { name: 'search_catalog', signature: 'signature-search-1' },
+        { name: 'check_stock', signature: 'signature-stock-2' },
       ],
     );
     const functionResponses = finalRequest.contents
@@ -2031,14 +2269,128 @@ test('Gemini agent tool loop preserves call IDs and thought signatures across se
       .filter((part) => part.functionResponse);
     assert.deepEqual(
       functionResponses.map((part) => ({
-        id: part.functionResponse.id,
         name: part.functionResponse.name,
       })),
       [
-        { id: 'call-search-1', name: 'search_catalog' },
-        { id: 'call-stock-2', name: 'check_stock' },
+        { name: 'search_catalog' },
+        { name: 'check_stock' },
       ],
     );
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Gemini preserves a reconstructed AI Agent tool turn instead of collapsing its history', async () => {
+  const originalFetch = global.fetch;
+  const requestBodies = [];
+  const responses = [
+    {
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: [
+              {
+                functionCall: {
+                  id: 'call-reconstructed',
+                  name: 'lookup_customer',
+                  args: { customerId: '42' },
+                },
+                thoughtSignature: 'signature-reconstructed',
+              },
+            ],
+          },
+          finishReason: 'STOP',
+          index: 0,
+        },
+      ],
+      usageMetadata,
+    },
+    {
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: [{ text: 'Cliente localizado.' }],
+          },
+          finishReason: 'STOP',
+          index: 0,
+        },
+      ],
+      usageMetadata,
+    },
+  ];
+
+  global.fetch = async (request, init) => {
+    requestBodies.push(await readFetchJson(request, init));
+    return new Response(JSON.stringify(responses[requestBodies.length - 1]), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const model = new GeminiChatModel({
+      apiKey: 'test',
+      model: 'gemini-3.5-flash-lite',
+      maxRetries: 0,
+    }).bindTools([
+      {
+        functionDeclarations: [
+          {
+            name: 'lookup_customer',
+            description: 'Find a customer',
+            parameters: {
+              type: 'object',
+              properties: { customerId: { type: 'string' } },
+              required: ['customerId'],
+            },
+          },
+        ],
+      },
+    ]);
+    const human = new N8n2326HumanMessage('Busque o cliente 42');
+    const first = await model.invoke([human]);
+    const signatureMap =
+      first.additional_kwargs.__gemini_function_call_thought_signatures__;
+
+    // AI Agent V3 can reconstruct an AIMessage from its engine step instead
+    // of reusing the exact object returned by the model.
+    const reconstructed = new N8n2326AIMessage({
+      content: [],
+      tool_calls: first.tool_calls.map(({ id, name, args, type }) => ({
+        id,
+        name,
+        args,
+        type,
+      })),
+      additional_kwargs: {
+        __gemini_function_call_thought_signatures__: { ...signatureMap },
+      },
+    });
+    const toolResult = new N8n2326ToolMessage({
+      content: JSON.stringify({ id: 42, active: true }),
+      tool_call_id: first.tool_calls[0].id,
+      name: 'lookup_customer',
+    });
+
+    const final = await model.invoke([human, reconstructed, toolResult]);
+    assert.equal(final.text, 'Cliente localizado.');
+
+    const history = requestBodies[1].contents;
+    assert.deepEqual(history.map((entry) => entry.role), [
+      'user',
+      'model',
+      'user',
+    ]);
+    const functionCall = history[1].parts.find((part) => part.functionCall);
+    assert.equal(functionCall.functionCall.name, 'lookup_customer');
+    assert.equal(functionCall.thoughtSignature, 'signature-reconstructed');
+    const functionResponse = history[2].parts.find(
+      (part) => part.functionResponse,
+    );
+    assert.equal(functionResponse.functionResponse.name, 'lookup_customer');
   } finally {
     global.fetch = originalFetch;
   }
@@ -2089,8 +2441,8 @@ test('Gemini automatically recovers one truly empty STOP response and aggregates
     },
   ];
 
-  global.fetch = async (request) => {
-    requestBodies.push(JSON.parse(await request.clone().text()));
+  global.fetch = async (request, init) => {
+    requestBodies.push(await readFetchJson(request, init));
     return new Response(JSON.stringify(responses[requestBodies.length - 1]), {
       status: 200,
       headers: { 'content-type': 'application/json' },
@@ -2390,8 +2742,8 @@ test('Gemini completes a multi-tool agent loop when the terminal call is initial
     },
   ];
 
-  global.fetch = async (request) => {
-    requestBodies.push(JSON.parse(await request.clone().text()));
+  global.fetch = async (request, init) => {
+    requestBodies.push(await readFetchJson(request, init));
     return new Response(JSON.stringify(responses[requestBodies.length - 1]), {
       status: 200,
       headers: { 'content-type': 'application/json' },
@@ -2519,8 +2871,8 @@ test('Gemini agent tool loop preserves parallel calls and matches every tool res
     },
   ];
 
-  global.fetch = async (request) => {
-    requestBodies.push(JSON.parse(await request.clone().text()));
+  global.fetch = async (request, init) => {
+    requestBodies.push(await readFetchJson(request, init));
     return new Response(JSON.stringify(responses[requestBodies.length - 1]), {
       status: 200,
       headers: { 'content-type': 'application/json' },
@@ -2596,7 +2948,7 @@ test('Gemini agent tool loop preserves parallel calls and matches every tool res
       .filter((content) => content.role === 'model')
       .flatMap((content) => content.parts);
     assert.equal(
-      modelParts.find((part) => part.functionCall?.id === 'call-price')
+      modelParts.find((part) => part.functionCall?.name === 'get_price')
         .thoughtSignature,
       'signature-parallel',
     );
@@ -2606,12 +2958,11 @@ test('Gemini agent tool loop preserves parallel calls and matches every tool res
         .flatMap((content) => content.parts)
         .filter((part) => part.functionResponse)
         .map((part) => ({
-          id: part.functionResponse.id,
           name: part.functionResponse.name,
         })),
       [
-        { id: 'call-price', name: 'get_price' },
-        { id: 'call-delivery', name: 'get_delivery' },
+        { name: 'get_price' },
+        { name: 'get_delivery' },
       ],
     );
   } finally {
@@ -2704,8 +3055,8 @@ test('Gemini streaming recovers an empty STOP before emitting output and preserv
       responseId: 'stream-recovered',
     },
   ];
-  global.fetch = async (request) => {
-    requestBodies.push(JSON.parse(await request.clone().text()));
+  global.fetch = async (request, init) => {
+    requestBodies.push(await readFetchJson(request, init));
     const event = events[requestBodies.length - 1];
     return new Response(`data: ${JSON.stringify(event)}\n\n`, {
       status: 200,
@@ -2791,6 +3142,7 @@ test('n8n tracing marks the chat-model subnode as executed and exposes thoughts 
     geminiOptions: {
       thinkingBudget: 256,
       includeThoughts: true,
+      includeTokenUsageInAgentOutput: true,
     },
   };
   const context = {
@@ -2900,6 +3252,163 @@ test('n8n tracing hides thoughts unless Include Thoughts is enabled', async () =
   }
 });
 
+test('tool-only Gemini calls stay executable while trace and Usage Reporter expose every call', async () => {
+  const originalFetch = global.fetch;
+  const rawCalls = [
+    {
+      functionCall: {
+        name: 'example_lookup',
+        args: { resourceId: 'resource-a' },
+        id: 'call-a',
+      },
+      thoughtSignature: 'signature-a',
+    },
+    {
+      functionCall: {
+        name: 'example_lookup',
+        args: { resourceId: 'resource-b' },
+        id: 'call-b',
+      },
+      thoughtSignature: 'signature-b',
+    },
+  ];
+  global.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        candidates: [
+          {
+            content: { role: 'model', parts: rawCalls },
+            finishReason: 'STOP',
+            finishMessage: 'Model generated function call(s).',
+            index: 0,
+          },
+        ],
+        usageMetadata,
+        modelVersion: 'gemini-test-tools',
+        responseId: 'response-tools',
+      }),
+      {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      },
+    );
+
+  const outputs = [];
+  const reports = [];
+  const parameters = {
+    provider: 'gemini',
+    geminiModel: 'gemini-3.5-flash-lite',
+    geminiOptions: {
+      usageReporter: {
+        settings: {
+          enabled: true,
+          inputTextMode: 'prompt',
+          includeOutputText: true,
+        },
+      },
+    },
+  };
+  const context = {
+    getNodeParameter(name, _itemIndex, fallback) {
+      return parameters[name] ?? fallback;
+    },
+    async getCredentials() {
+      return { apiKey: 'test' };
+    },
+    getNode() {
+      return { name: 'Universal Chat Model', parameters };
+    },
+    getParentNodes() {
+      return [{ name: 'UsageReporterTool' }];
+    },
+    async getInputConnectionData() {
+      return {
+        async func(payload) {
+          reports.push(structuredClone(payload));
+          return 'ok';
+        },
+      };
+    },
+    getWorkflow() {
+      return { id: 'workflow-tools', name: 'Tool Monitoring' };
+    },
+    getExecutionId() {
+      return 'execution-tools';
+    },
+    addInputData() {
+      return { index: 0 };
+    },
+    addOutputData(connectionType, index, data) {
+      outputs.push({ connectionType, index, data });
+    },
+    getNextRunIndex() {
+      return 0;
+    },
+    logAiEvent() {},
+    logger: { warn() {} },
+  };
+  const expectedCalls = [
+    {
+      type: 'functionCall',
+      functionCall: {
+        name: 'example_lookup',
+        args: { resourceId: 'resource-a' },
+        id: 'call-a',
+      },
+    },
+    {
+      type: 'functionCall',
+      functionCall: {
+        name: 'example_lookup',
+        args: { resourceId: 'resource-b' },
+        id: 'call-b',
+      },
+    },
+  ];
+
+  try {
+    const supplied = await new UniversalChatModel().supplyData.call(context, 0);
+    const message = await supplied.response
+      .bindTools([
+        {
+          functionDeclarations: [
+            {
+              name: 'example_lookup',
+              description: 'Looks up one example resource',
+              parameters: {
+                type: 'object',
+                properties: { resourceId: { type: 'string' } },
+                required: ['resourceId'],
+              },
+            },
+          ],
+        },
+      ])
+      .invoke('adicione as duas skills');
+
+    // The real AIMessage remains tool-only so the parent agent can execute it.
+    assert.equal(message.text, '');
+    assert.equal(message.tool_calls.length, 2);
+    assert.deepEqual(
+      message.tool_calls.map(({ name, args, id }) => ({ name, args, id })),
+      expectedCalls.map(({ functionCall }) => functionCall),
+    );
+
+    assert.equal(outputs.length, 1);
+    const trace = outputs[0].data[0][0].json;
+    assert.deepEqual(trace.response.generations[0][0].toolCalls, expectedCalls);
+    assert.equal(
+      trace.response.generations[0][0].text,
+      JSON.stringify(expectedCalls),
+    );
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].output_text, JSON.stringify(expectedCalls));
+    assert.equal(reports[0].output_token, usageMetadata.candidatesTokenCount);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('Usage Reporter receives exact per-call tokens and workflow metadata', async () => {
   const originalFetch = global.fetch;
   global.fetch = async () =>
@@ -2934,11 +3443,11 @@ test('Usage Reporter receives exact per-call tokens and workflow metadata', asyn
       return { apiKey: 'test' };
     },
     getNode() {
-      return { name: 'Modelo Resumidor RAG', parameters };
+      return { name: 'Example Model', parameters };
     },
     getParentNodes(_nodeName, options) {
       assert.equal(options.connectionType, 'ai_tool');
-      return [{ name: 'MonitorarTokens11' }];
+      return [{ name: 'UsageReporterTool' }];
     },
     async getInputConnectionData(connectionType) {
       assert.equal(connectionType, 'ai_tool');
@@ -2953,10 +3462,10 @@ test('Usage Reporter receives exact per-call tokens and workflow metadata', asyn
       };
     },
     getWorkflow() {
-      return { id: 'workflow-rag', name: 'Produtos Digitais' };
+      return { id: 'workflow-example', name: 'Example Workflow' };
     },
     getExecutionId() {
-      return 'execution-123';
+      return 'execution-example';
     },
     addInputData() {
       return { index: 0 };
@@ -2994,10 +3503,10 @@ test('Usage Reporter receives exact per-call tokens and workflow metadata', asyn
     assert.equal(report.model_calls, 1);
     assert.equal(report.input_text, 'RAG');
     assert.equal(report.output_text, 'Resposta final');
-    assert.equal(report.workflow_id, 'workflow-rag');
-    assert.equal(report.workflow_name, 'Produtos Digitais');
-    assert.equal(report.execution_id, 'execution-123');
-    assert.equal(report.node, 'Modelo Resumidor RAG');
+    assert.equal(report.workflow_id, 'workflow-example');
+    assert.equal(report.workflow_name, 'Example Workflow');
+    assert.equal(report.execution_id, 'execution-example');
+    assert.equal(report.node, 'Example Model');
 
     const dump = JSON.parse(report.dump);
     assert.equal(dump.provider, 'gemini');
@@ -3005,6 +3514,101 @@ test('Usage Reporter receives exact per-call tokens and workflow metadata', asyn
     assert.equal(dump.tokenUsage.inputTokens, 100);
     assert.equal(dump.usageMetadata.toolUsePromptTokenCount, 7);
     assert.equal(dump.gemini.modelVersion, 'gemini-test-001');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Usage Reporter prompt mode sends only the latest human input', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async () =>
+    new Response(JSON.stringify(makeGeminiResponse()), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+
+  const reports = [];
+  const parameters = {
+    provider: 'gemini',
+    geminiModel: 'gemini-2.5-flash',
+    geminiOptions: {
+      systemMessage: 'NODE_SYSTEM_MUST_NOT_BE_REPORTED',
+      usageReporter: {
+        settings: {
+          enabled: true,
+          inputTextMode: 'prompt',
+          includeOutputText: true,
+        },
+      },
+    },
+  };
+  const context = {
+    getNodeParameter(name, _itemIndex, fallback) {
+      return parameters[name] ?? fallback;
+    },
+    async getCredentials() {
+      return { apiKey: 'test' };
+    },
+    getNode() {
+      return { name: 'User Input Monitor', parameters };
+    },
+    getParentNodes() {
+      return [{ name: 'UsageReporterTool' }];
+    },
+    async getInputConnectionData() {
+      return {
+        async func(payload) {
+          reports.push(structuredClone(payload));
+        },
+      };
+    },
+    getWorkflow() {
+      return { id: 'workflow-user-input', name: 'User Input' };
+    },
+    getExecutionId() {
+      return 'execution-user-input';
+    },
+    addInputData() {
+      return { index: 0 };
+    },
+    addOutputData() {},
+    getNextRunIndex() {
+      return 0;
+    },
+    logAiEvent() {},
+    logger: { warn() {} },
+  };
+  const userInput = 'Qual foi o faturamento de julho?';
+  const previousToolCall = new AIMessage({
+    content: '',
+    tool_calls: [
+      {
+        name: 'analytics_lookup',
+        args: { query: 'TOOL_CALL_MUST_NOT_BE_REPORTED' },
+        id: 'previous-analytics-call',
+        type: 'tool_call',
+      },
+    ],
+  });
+  const previousToolResult = new N8n2326ToolMessage({
+    content: 'TOOL_RESULT_MUST_NOT_BE_REPORTED',
+    tool_call_id: 'previous-analytics-call',
+    name: 'analytics_lookup',
+  });
+
+  try {
+    const supplied = await new UniversalChatModel().supplyData.call(context, 0);
+    await supplied.response.invoke([
+      new SystemMessage('PARENT_SYSTEM_MUST_NOT_BE_REPORTED'),
+      new HumanMessage(userInput),
+      previousToolCall,
+      previousToolResult,
+    ]);
+
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].input_text, userInput);
+    assert.equal(reports[0].input_text.includes('SYSTEM'), false);
+    assert.equal(reports[0].input_text.includes('TOOL_'), false);
   } finally {
     global.fetch = originalFetch;
   }
@@ -3037,7 +3641,7 @@ test('Usage Reporter failures are non-blocking by default', async () => {
       return { apiKey: 'test' };
     },
     getNode() {
-      return { name: 'Modelo RAG', parameters };
+      return { name: 'Example Model', parameters };
     },
     getParentNodes() {
       return [{ name: 'Reporter com falha' }];
@@ -3045,14 +3649,14 @@ test('Usage Reporter failures are non-blocking by default', async () => {
     async getInputConnectionData() {
       return {
         async invoke(payload) {
-          assert.match(payload.input_text, /resuma/);
+          assert.match(payload.input_text, /summarize/);
           assert.equal(payload.output_text, '');
           throw new Error('subworkflow indisponível');
         },
       };
     },
     getWorkflow() {
-      return { id: 'workflow-rag', name: 'RAG' };
+      return { id: 'workflow-example', name: 'Example Workflow' };
     },
     getExecutionId() {
       return 'execution-456';
@@ -3074,7 +3678,7 @@ test('Usage Reporter failures are non-blocking by default', async () => {
 
   try {
     const supplied = await new UniversalChatModel().supplyData.call(context, 0);
-    const message = await supplied.response.invoke('resuma este RAG');
+    const message = await supplied.response.invoke('summarize this input');
 
     assert.equal(message.text, 'Resposta final');
     assert.equal(warnings.length, 1);
@@ -3084,10 +3688,95 @@ test('Usage Reporter failures are non-blocking by default', async () => {
   }
 });
 
+test('slow Usage Reporter never holds a successful model call indefinitely', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async () =>
+    new Response(JSON.stringify(makeGeminiResponse()), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+
+  let reporterStarted = 0;
+  let reporterCompleted = 0;
+  const warnings = [];
+  const parameters = {
+    provider: 'gemini',
+    geminiModel: 'gemini-2.5-flash',
+    geminiOptions: {
+      usageReporter: {
+        settings: {
+          enabled: true,
+          reporterMaxWaitMs: 20,
+        },
+      },
+    },
+  };
+  const context = {
+    getNodeParameter(name, _itemIndex, fallback) {
+      return parameters[name] ?? fallback;
+    },
+    async getCredentials() {
+      return { apiKey: 'test' };
+    },
+    getNode() {
+      return { name: 'Production Model', parameters };
+    },
+    getParentNodes() {
+      return [{ name: 'Slow Reporter' }];
+    },
+    async getInputConnectionData() {
+      return {
+        async func() {
+          reporterStarted += 1;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          reporterCompleted += 1;
+        },
+      };
+    },
+    getWorkflow() {
+      return { id: 'workflow-slow-reporter', name: 'Production' };
+    },
+    getExecutionId() {
+      return 'execution-slow-reporter';
+    },
+    addInputData() {
+      return { index: 0 };
+    },
+    addOutputData() {},
+    getNextRunIndex() {
+      return 0;
+    },
+    logAiEvent() {},
+    logger: {
+      warn(message) {
+        warnings.push(message);
+      },
+    },
+  };
+
+  try {
+    const supplied = await new UniversalChatModel().supplyData.call(context, 0);
+    const startedAt = Date.now();
+    const message = await supplied.response.invoke('do not wait for telemetry');
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(message.text, 'Resposta final');
+    assert.equal(reporterStarted, 1);
+    assert.equal(reporterCompleted, 0);
+    assert.ok(elapsedMs < 180, `model call waited ${elapsedMs} ms`);
+    assert.match(warnings[0], /maximum wait|maximum|exceeded/i);
+
+    await new Promise((resolve) => setTimeout(resolve, 270));
+    assert.equal(reporterCompleted, 1);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('concurrent Usage Reporter events keep prompts, outputs, and tokens isolated', async () => {
   const originalFetch = global.fetch;
-  global.fetch = async (request) => {
-    const body = JSON.parse(await request.clone().text());
+  global.fetch = async (request, init) => {
+    const body = await readFetchJson(request, init);
     const prompt = body.contents[0].parts[0].text;
     const isA = prompt === 'request-A';
     await new Promise((resolve) => setTimeout(resolve, isA ? 15 : 2));
@@ -3144,7 +3833,7 @@ test('concurrent Usage Reporter events keep prompts, outputs, and tokens isolate
       return { name: 'Modelo Concorrente', parameters };
     },
     getParentNodes() {
-      return [{ name: 'MonitorarTokens11' }];
+      return [{ name: 'UsageReporterTool' }];
     },
     async getInputConnectionData() {
       return {
@@ -3320,9 +4009,10 @@ test('streaming sends one complete Usage Reporter event with final token metadat
     geminiOptions: {
       thinkingBudget: 256,
       includeThoughts: true,
+      includeTokenUsageInAgentOutput: true,
     },
     usageReportingOptions: {
-      nodeLabel: 'RAG Streaming',
+      nodeLabel: 'Streaming Example',
     },
   };
   const context = {
@@ -3336,7 +4026,7 @@ test('streaming sends one complete Usage Reporter event with final token metadat
       return { name: 'Universal Chat Model', parameters };
     },
     getParentNodes() {
-      return [{ name: 'MonitorarTokens11' }];
+      return [{ name: 'UsageReporterTool' }];
     },
     async getInputConnectionData() {
       return {
@@ -3346,7 +4036,7 @@ test('streaming sends one complete Usage Reporter event with final token metadat
       };
     },
     getWorkflow() {
-      return { id: 'workflow-stream', name: 'RAG Streaming' };
+      return { id: 'workflow-stream', name: 'Streaming Example' };
     },
     getExecutionId() {
       return 'execution-stream';
@@ -3397,11 +4087,158 @@ test('streaming sends one complete Usage Reporter event with final token metadat
     assert.equal(reports[0].input_token, 100);
     assert.equal(reports[0].thoughts_token, 13);
     assert.equal(reports[0].tool_token, 7);
-    assert.equal(reports[0].node, 'RAG Streaming');
+    assert.equal(reports[0].node, 'Streaming Example');
     assert.equal(
       JSON.stringify(trace).split('Resumo do raciocínio').length - 1,
       1,
     );
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('streaming tool calls are observable without adding text to the executable AIMessage', async () => {
+  const originalFetch = global.fetch;
+  const toolChunk = {
+    candidates: [
+      {
+        content: {
+          role: 'model',
+          parts: [
+            {
+              functionCall: {
+                name: 'analytics_lookup',
+                args: {
+                  query: 'status:active',
+                  datasetId: 'dataset-stream',
+                  id: 'call-stream',
+                },
+                id: 'call-stream',
+              },
+              thoughtSignature: 'signature-stream',
+            },
+          ],
+        },
+        finishReason: 'STOP',
+        finishMessage: 'Model generated function call(s).',
+        index: 0,
+      },
+    ],
+    usageMetadata,
+    modelVersion: 'gemini-stream-tools',
+    responseId: 'response-stream-tools',
+  };
+  global.fetch = async () =>
+    new Response(`data: ${JSON.stringify(toolChunk)}\n\n`, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    });
+
+  const outputs = [];
+  const reports = [];
+  const parameters = {
+    provider: 'gemini',
+    geminiModel: 'gemini-3.5-flash-lite',
+    geminiOptions: {
+      usageReporter: {
+        settings: {
+          enabled: true,
+          inputTextMode: 'prompt',
+          includeOutputText: true,
+        },
+      },
+    },
+  };
+  const context = {
+    getNodeParameter(name, _itemIndex, fallback) {
+      return parameters[name] ?? fallback;
+    },
+    async getCredentials() {
+      return { apiKey: 'test' };
+    },
+    getNode() {
+      return { name: 'Streaming Tool Model', parameters };
+    },
+    getParentNodes() {
+      return [{ name: 'UsageReporterTool' }];
+    },
+    async getInputConnectionData() {
+      return {
+        async func(payload) {
+          reports.push(structuredClone(payload));
+        },
+      };
+    },
+    getWorkflow() {
+      return { id: 'workflow-stream-tool', name: 'Streaming Tool' };
+    },
+    getExecutionId() {
+      return 'execution-stream-tool';
+    },
+    addInputData() {
+      return { index: 0 };
+    },
+    addOutputData(connectionType, index, data) {
+      outputs.push({ connectionType, index, data });
+    },
+    getNextRunIndex() {
+      return 0;
+    },
+    logAiEvent() {},
+    logger: { warn() {} },
+  };
+  const expected = [
+    {
+      type: 'functionCall',
+      functionCall: {
+        name: 'analytics_lookup',
+        args: {
+          query: 'status:active',
+          datasetId: 'dataset-stream',
+          id: 'call-stream',
+        },
+        id: 'call-stream',
+      },
+    },
+  ];
+
+  try {
+    const supplied = await new UniversalChatModel().supplyData.call(context, 0);
+    const stream = await supplied.response
+      .bindTools([
+        {
+          functionDeclarations: [
+            {
+              name: 'analytics_lookup',
+              description: 'Runs an example analytics query',
+              parameters: {
+                type: 'object',
+                properties: {
+                  query: { type: 'string' },
+                  datasetId: { type: 'string' },
+                  id: { type: 'string' },
+                },
+                required: ['query', 'datasetId'],
+              },
+            },
+          ],
+        },
+      ])
+      .stream('consulte o Power BI');
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(chunk);
+
+    assert.equal(chunks.map((chunk) => chunk.text).join(''), '');
+    assert.equal(
+      chunks.flatMap((chunk) => chunk.tool_calls ?? []).some((call) => call.name === 'analytics_lookup'),
+      true,
+    );
+    assert.equal(outputs.length, 1);
+    const trace = outputs[0].data[0][0].json;
+    assert.deepEqual(trace.response.generations[0][0].toolCalls, expected);
+    assert.equal(trace.response.generations[0][0].text, JSON.stringify(expected));
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].output_text, JSON.stringify(expected));
   } finally {
     global.fetch = originalFetch;
   }
@@ -3485,6 +4322,7 @@ test('AI Agent output receives separate thoughts and aggregated model metadata',
     geminiOptions: {
       thinkingBudget: 256,
       includeThoughts: true,
+      includeTokenUsageInAgentOutput: true,
     },
   };
   const context = {
@@ -3554,7 +4392,7 @@ test('AI Agent output receives separate thoughts and aggregated model metadata',
   }
 });
 
-test('AI Agent can hide token usage while Usage Reporter still receives it', async () => {
+test('AI Agent hides token usage by default while Usage Reporter still receives it', async () => {
   const originalFetch = global.fetch;
   global.fetch = async () =>
     new Response(JSON.stringify(makeGeminiResponse()), {
@@ -3567,7 +4405,6 @@ test('AI Agent can hide token usage while Usage Reporter still receives it', asy
     provider: 'gemini',
     geminiModel: 'gemini-2.5-flash',
     geminiOptions: {
-      includeTokenUsageInAgentOutput: false,
       usageReporter: {
         settings: {
           enabled: true,
@@ -3583,10 +4420,10 @@ test('AI Agent can hide token usage while Usage Reporter still receives it', asy
       return { apiKey: 'test' };
     },
     getNode() {
-      return { name: 'Modelo de Produção', parameters };
+      return { name: 'Example Model', parameters };
     },
     getParentNodes() {
-      return [{ name: 'Monitor de Tokens' }];
+      return [{ name: 'Usage Monitor' }];
     },
     async getInputConnectionData() {
       return {
@@ -3596,7 +4433,7 @@ test('AI Agent can hide token usage while Usage Reporter still receives it', asy
       };
     },
     getWorkflow() {
-      return { id: 'workflow-agent', name: 'Agente de Produção' };
+      return { id: 'workflow-agent', name: 'Example Agent' };
     },
     getExecutionId() {
       return 'execution-agent';
@@ -3656,6 +4493,150 @@ test('AI Agent can hide token usage while Usage Reporter still receives it', asy
   }
 });
 
+test('AI Agent optionally exposes compact intermediate steps without internal messages or Gemini signatures', async () => {
+  const fixture = join(
+    __dirname,
+    'fixtures',
+    'n8n-nodes-langchain',
+    'dist',
+    'nodes',
+    'agents',
+    'Agent',
+    'V2',
+    'AgentV2.node.cjs',
+  );
+  const { AgentV2 } = require(fixture);
+  installAgentOutputBridge();
+
+  const internalMessage = {
+    lc_serializable: true,
+    lc_kwargs: {
+      content: [],
+      tool_calls: [
+        {
+          id: 'call-secret',
+          name: 'example_lookup',
+          args: { resourceId: 'resource-id' },
+          thoughtSignature: 'internal-signature',
+        },
+      ],
+      additional_kwargs: {
+        __gemini_function_call_thought_signatures__: {
+          'call-secret': 'internal-signature',
+        },
+      },
+    },
+  };
+
+  const agent = new AgentV2();
+  agent.run = async () => {
+    recordAgentModelMetadata({
+      includeIntermediateStepsInOutput: true,
+    });
+    return [
+      [
+        {
+          json: {
+            output: 'Resposta final limpa',
+            intermediateSteps: [
+              {
+                action: {
+                  tool: 'example_lookup',
+                  toolInput: { resourceId: 'resource-id' },
+                  log: 'Calling example_lookup',
+                  messageLog: [internalMessage],
+                },
+                observation: 'Example resource returned',
+              },
+            ],
+          },
+        },
+      ],
+    ];
+  };
+
+  const result = await agent.execute();
+  const output = result[0][0].json;
+  const publicStep = output.intermediateSteps[0];
+
+  assert.equal(output.output, 'Resposta final limpa');
+  assert.deepEqual(publicStep.action, {
+    tool: 'example_lookup',
+    toolInput: { resourceId: 'resource-id' },
+    log: 'Calling example_lookup',
+  });
+  assert.equal(publicStep.observation, 'Example resource returned');
+  assert.equal(JSON.stringify(output).includes('internal-signature'), false);
+  assert.equal(JSON.stringify(output).includes('lc_serializable'), false);
+
+  // Sanitizing the public result must not mutate the internal message object.
+  assert.equal(
+    internalMessage.lc_kwargs.additional_kwargs
+      .__gemini_function_call_thought_signatures__['call-secret'],
+    'internal-signature',
+  );
+});
+
+test('AI Agent removes intermediate steps by default when using Universal Chat Model', async () => {
+  const fixture = join(
+    __dirname,
+    'fixtures',
+    'n8n-nodes-langchain',
+    'dist',
+    'nodes',
+    'agents',
+    'Agent',
+    'V2',
+    'AgentV2.node.cjs',
+  );
+  const { AgentV2 } = require(fixture);
+  installAgentOutputBridge();
+
+  const agent = new AgentV2();
+  agent.run = async () => {
+    recordAgentModelMetadata({
+      includeIntermediateStepsInOutput: false,
+    });
+    return [[{ json: {
+      output: 'Resposta final',
+      intermediateSteps: [{ action: { tool: 'Busca' }, observation: 'resultado' }],
+    } }]];
+  };
+
+  const result = await agent.execute();
+  assert.equal(result[0][0].json.output, 'Resposta final');
+  assert.equal(result[0][0].json.intermediateSteps, undefined);
+});
+
+test('Agent bridge does not change intermediate steps produced by another Chat Model', async () => {
+  const fixture = join(
+    __dirname,
+    'fixtures',
+    'n8n-nodes-langchain',
+    'dist',
+    'nodes',
+    'agents',
+    'Agent',
+    'V2',
+    'AgentV2.node.cjs',
+  );
+  const { AgentV2 } = require(fixture);
+  installAgentOutputBridge();
+
+  const originalSteps = [{
+    action: { tool: 'OutroModelo', messageLog: [{ internal: true }] },
+    observation: 'resultado',
+  }];
+  const agent = new AgentV2();
+  agent.run = async () => [[{ json: {
+    output: 'Resposta de outro modelo',
+    intermediateSteps: structuredClone(originalSteps),
+  } }]];
+
+  const result = await agent.execute();
+  assert.deepEqual(result[0][0].json.intermediateSteps, originalSteps);
+});
+
 test('AI Agent loaded after the community node still receives metadata', async () => {
   const fixture = join(
     __dirname,
@@ -3677,6 +4658,7 @@ test('AI Agent loaded after the community node still receives metadata', async (
   agent.run = async () => {
     recordAgentModelMetadata({
       thoughts: [{ text: 'Pensamento carregado tardiamente' }],
+      includeTokenUsageInAgentOutput: true,
       tokenUsage: {
         inputTokens: 12,
         inputUncachedTokens: 7,
@@ -3726,6 +4708,7 @@ test('AI Agent promotes Structured Output JSON into separate output fields', asy
   agent.run = async () => {
     recordAgentModelMetadata({
       structuredOutput: structured,
+      includeTokenUsageInAgentOutput: true,
       tokenUsage: {
         inputTokens: 10,
         inputUncachedTokens: 10,
@@ -3804,6 +4787,7 @@ test('parallel AI Agent executions keep thoughts and token usage isolated', asyn
     agent.run = async () => {
       recordAgentModelMetadata({
         thoughts: [{ text: `Pensamento ${label} 1` }],
+        includeTokenUsageInAgentOutput: true,
         tokenUsage: {
           inputTokens: tokens,
           totalTokens: tokens,
@@ -3812,6 +4796,7 @@ test('parallel AI Agent executions keep thoughts and token usage isolated', asyn
       await new Promise((resolve) => setTimeout(resolve, delay));
       recordAgentModelMetadata({
         thoughts: [{ text: `Pensamento ${label} 2` }],
+        includeTokenUsageInAgentOutput: true,
         tokenUsage: {
           outputTokens: tokens,
           totalTokens: tokens,
@@ -3863,6 +4848,7 @@ test('AI Agent V3 preserves metadata across tool-call iterations', async () => {
   const agent = new AgentV3();
   agent.run = async (response) => {
     recordAgentModelMetadata({
+      includeTokenUsageInAgentOutput: true,
       tokenUsage: {
         inputTokens: 10,
         inputUncachedTokens: 8,
@@ -4241,6 +5227,7 @@ test('AI Agent keeps thought text hidden when Include Thoughts is disabled', asy
     geminiModel: 'gemini-2.5-flash',
     geminiOptions: {
       thinkingBudget: 256,
+      includeTokenUsageInAgentOutput: true,
     },
   };
   const context = {

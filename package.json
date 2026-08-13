@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-universal-chatmodel",
-  "version": "1.0.26",
+  "version": "1.0.33",
   "description": "Production-oriented n8n community Chat Model for native Google Gemini and OpenAI-compatible APIs",
   "keywords": [
     "n8n-community-node-package",
@@ -58,8 +58,9 @@
     ]
   },
   "dependencies": {
+    "@google/generative-ai": "0.24.0",
     "@langchain/core": "1.2.4",
-    "@langchain/google": "0.2.1",
+    "@langchain/google-genai": "2.1.24",
     "@langchain/openai": "1.5.5"
   },
   "peerDependencies": {

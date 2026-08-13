@@ -1,4 +1,5 @@
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
+import type { BaseMessage } from '@langchain/core/messages';
 import type { LLMResult } from '@langchain/core/outputs';
 import {
   NodeConnectionTypes,
@@ -54,6 +55,69 @@ function asRecord(value: unknown): Record<string, any> | undefined {
   return value !== null && typeof value === 'object'
     ? (value as Record<string, any>)
     : undefined;
+}
+
+function messageType(message: unknown): string {
+  const record = asRecord(message);
+  if (!record) return '';
+  if (typeof record.type === 'string') return record.type.toLowerCase();
+  if (typeof record.getType === 'function') {
+    try {
+      const type = record.getType();
+      if (typeof type === 'string') return type.toLowerCase();
+    } catch {
+      // Fall through to legacy type detection.
+    }
+  }
+  if (typeof record._getType === 'function') {
+    try {
+      const type = record._getType();
+      if (typeof type === 'string') return type.toLowerCase();
+    } catch {
+      // Ignore malformed third-party message implementations.
+    }
+  }
+  const constructorName = record.constructor?.name;
+  return typeof constructorName === 'string'
+    ? constructorName.replace(/Message(?:Chunk)?$/i, '').toLowerCase()
+    : '';
+}
+
+function messageContentText(message: unknown): string {
+  const record = asRecord(message);
+  if (!record) return '';
+  if (typeof record.content === 'string') return record.content;
+  if (!Array.isArray(record.content)) return '';
+
+  return record.content
+    .map((block: unknown) => {
+      if (typeof block === 'string') return block;
+      const value = asRecord(block);
+      if (!value) return '';
+      if (typeof value.text === 'string') return value.text;
+      const nestedText = asRecord(value.text);
+      return typeof nestedText?.text === 'string' ? nestedText.text : '';
+    })
+    .filter((text: string) => text.length > 0)
+    .join('\n');
+}
+
+function latestHumanInput(messages: BaseMessage[][]): string[] {
+  const flattened = messages.flat();
+  for (let index = flattened.length - 1; index >= 0; index -= 1) {
+    const message = flattened[index];
+    if (!['human', 'user'].includes(messageType(message))) continue;
+    const text = messageContentText(message).trim();
+    if (text.length > 0) return [text];
+  }
+  return [];
+}
+
+function serializeInputMessages(messages: BaseMessage[][]): IDataObject[] {
+  return messages.flat().map((message) => ({
+    role: messageType(message),
+    content: messageContentText(message),
+  }));
 }
 
 function findMessages(output: LLMResult): Record<string, any>[] {
@@ -183,6 +247,162 @@ function extractThoughtsFromContent(content: unknown): unknown[] {
   });
 }
 
+function parseToolArguments(value: unknown): unknown {
+  if (typeof value !== 'string') return value ?? {};
+
+  try {
+    return JSON.parse(value);
+  } catch {
+    // Invalid/incomplete tool calls can legitimately contain arguments that
+    // are not valid JSON yet. Keep the original value observable instead of
+    // discarding it or changing the message delivered to the AI consumer.
+    return value;
+  }
+}
+
+function normalizeObservableToolCall(value: unknown): IDataObject | undefined {
+  const record = asRecord(value);
+  if (!record) return undefined;
+
+  const geminiCall = asRecord(record.functionCall) ?? asRecord(record.function_call);
+  const openAiCall = asRecord(record.function);
+  const call = geminiCall ?? openAiCall ?? record;
+  const name =
+    typeof call.name === 'string'
+      ? call.name
+      : typeof record.name === 'string'
+        ? record.name
+        : undefined;
+  if (!name) return undefined;
+
+  const rawArgs =
+    call.args !== undefined
+      ? call.args
+      : call.arguments !== undefined
+        ? call.arguments
+        : record.args !== undefined
+          ? record.args
+          : record.arguments;
+  const id =
+    typeof call.id === 'string'
+      ? call.id
+      : typeof record.id === 'string'
+        ? record.id
+        : typeof record.tool_call_id === 'string'
+          ? record.tool_call_id
+          : undefined;
+  return {
+    type: 'functionCall',
+    functionCall: {
+      name,
+      args: structuredClone(parseToolArguments(rawArgs)) as any,
+      ...(id ? { id } : {}),
+    },
+  };
+}
+
+/**
+ * Returns a provider-neutral, Gemini-compatible view of every tool call in a
+ * generation. This is observability data only: the underlying AIMessage is
+ * never changed, so n8n's agent continues to execute message.tool_calls.
+ */
+export function extractObservableToolCalls(
+  generation: any,
+  fallbackCalls: unknown[] = [],
+): IDataObject[] {
+  const capturedProviderCalls = fallbackCalls
+    .map(normalizeObservableToolCall)
+    .filter((call): call is IDataObject => call !== undefined);
+  if (capturedProviderCalls.length > 0) {
+    // The provider payload is authoritative. LangChain can replace a Gemini
+    // function-call ID with its own run ID while adapting the same call, which
+    // would otherwise make one invocation appear twice in observability data.
+    return capturedProviderCalls;
+  }
+
+  const message = asRecord(generation?.message);
+  const generationRecord = asRecord(generation);
+  const additionalKwargs = asRecord(message?.additional_kwargs);
+  const responseMetadata = asRecord(message?.response_metadata);
+  const generationInfo = asRecord(generationRecord?.generationInfo);
+  const content = Array.isArray(message?.content) ? message.content : [];
+  const contentBlocks = Array.isArray(message?.contentBlocks)
+    ? message.contentBlocks
+    : [];
+  const candidates = [
+    ...(Array.isArray(generationRecord?.tool_call_chunks)
+      ? generationRecord.tool_call_chunks
+      : []),
+    ...(Array.isArray(message?.tool_call_chunks) ? message.tool_call_chunks : []),
+    ...(Array.isArray(generationInfo?.tool_call_chunks)
+      ? generationInfo.tool_call_chunks
+      : []),
+    ...(Array.isArray(generationRecord?.tool_calls)
+      ? generationRecord.tool_calls
+      : []),
+    ...(Array.isArray(message?.tool_calls) ? message.tool_calls : []),
+    ...(Array.isArray(message?.invalid_tool_calls) ? message.invalid_tool_calls : []),
+    ...(Array.isArray(additionalKwargs?.tool_calls) ? additionalKwargs.tool_calls : []),
+    ...(additionalKwargs?.function_call ? [additionalKwargs.function_call] : []),
+    ...(Array.isArray(responseMetadata?.tool_calls) ? responseMetadata.tool_calls : []),
+    ...(Array.isArray(generationInfo?.tool_calls) ? generationInfo.tool_calls : []),
+    ...[...content, ...contentBlocks].filter((block) => {
+      const record = asRecord(block);
+      return Boolean(
+        record &&
+          (record.type === 'tool_call' ||
+            asRecord(record.functionCall) ||
+            asRecord(record.function_call) ||
+            asRecord(record.function)),
+      );
+    }),
+  ];
+
+  const calls: IDataObject[] = [];
+  const seen = new Map<string, number>();
+  for (const candidate of candidates) {
+    const call = normalizeObservableToolCall(candidate);
+    if (!call) continue;
+    const functionCall = asRecord(call.functionCall)!;
+    const key =
+      typeof functionCall.id === 'string' && functionCall.id.length > 0
+        ? `id:${functionCall.id}`
+        : JSON.stringify({
+            name: functionCall.name,
+            args: functionCall.args,
+          });
+    const existingIndex = seen.get(key);
+    if (existingIndex !== undefined) {
+      calls[existingIndex] = call;
+      continue;
+    }
+    seen.set(key, calls.length);
+    calls.push(call);
+  }
+
+  return calls;
+}
+
+export function observableGenerationText(
+  generation: any,
+  fallbackCalls: unknown[] = [],
+): string {
+  const rawText = generation?.text ?? '';
+  const text =
+    typeof rawText === 'string'
+      ? rawText
+      : rawText === undefined || rawText === null
+        ? ''
+        : JSON.stringify(rawText);
+  const toolCalls = extractObservableToolCalls(generation, fallbackCalls);
+  if (toolCalls.length === 0) return text;
+
+  const serializedCalls = JSON.stringify(toolCalls);
+  return text.trim().length > 0
+    ? `${text}\n${serializedCalls}`
+    : serializedCalls;
+}
+
 export function extractThoughtsFromResult(output: LLMResult): unknown[] {
   const thoughts: unknown[] = [];
 
@@ -222,20 +442,22 @@ export function extractThoughtsFromResult(output: LLMResult): unknown[] {
   });
 }
 
-function serializeGeneration(generation: any): IDataObject {
+function serializeGeneration(
+  generation: any,
+  fallbackCalls: unknown[] = [],
+): IDataObject {
   const rawText = generation?.text ?? '';
+  const toolCalls = extractObservableToolCalls(generation, fallbackCalls);
   const structuredOutput =
     parseStructuredOutput(rawText) ??
     parseStructuredOutput(generation?.message?.content);
-  const text =
-    typeof rawText === 'string'
-      ? rawText
-      : rawText === undefined || rawText === null
-        ? ''
-        : JSON.stringify(rawText);
+  const text = observableGenerationText(generation, fallbackCalls);
 
   return {
     text,
+    ...(toolCalls.length > 0
+      ? { toolCalls: structuredClone(toolCalls) as IDataObject[] }
+      : {}),
     ...(structuredOutput
       ? { structuredOutput: structuredClone(structuredOutput) }
       : {}),
@@ -278,7 +500,8 @@ export class UniversalChatModelTracing extends BaseCallbackHandler {
     private readonly executionFunctions: ISupplyDataFunctions,
     private readonly provider: ModelProvider,
     private readonly includeThoughts = false,
-    private readonly includeTokenUsageInAgentOutput = true,
+    private readonly includeTokenUsageInAgentOutput = false,
+    private readonly includeIntermediateStepsInOutput = false,
     private readonly usageReporter?: ModelUsageReporter,
     failOnReporterError = false,
   ) {
@@ -300,6 +523,26 @@ export class UniversalChatModelTracing extends BaseCallbackHandler {
     );
 
     this.runs.set(runId, { index, prompts: structuredClone(prompts) });
+  }
+
+  async handleChatModelStart(
+    _llm: unknown,
+    messages: BaseMessage[][],
+    runId: string,
+  ): Promise<void> {
+    const userInputs = latestHumanInput(messages);
+    const { index } = this.executionFunctions.addInputData(
+      NodeConnectionTypes.AiLanguageModel,
+      [[{ json: { messages: serializeInputMessages(messages) } }]],
+    );
+
+    // Usage Reporter receives only the current human input. System prompts,
+    // previous AI tool calls and ToolMessages remain visible in n8n's trace,
+    // but are intentionally excluded from input_text.
+    this.runs.set(runId, {
+      index,
+      prompts: structuredClone(userInputs),
+    });
   }
 
   async handleLLMEnd(output: LLMResult, runId: string): Promise<void> {
@@ -326,8 +569,13 @@ export class UniversalChatModelTracing extends BaseCallbackHandler {
       structuredOutputs.length > 0
         ? structuredOutputs[structuredOutputs.length - 1]
         : undefined;
+    const fallbackToolCalls = Array.isArray(gemini?.functionCalls)
+      ? gemini.functionCalls
+      : [];
     const generations = (output.generations ?? []).map((generationList) =>
-      (generationList ?? []).map(serializeGeneration),
+      (generationList ?? []).map((generation) =>
+        serializeGeneration(generation, fallbackToolCalls),
+      ),
     );
 
     const result: IDataObject = {
@@ -356,6 +604,7 @@ export class UniversalChatModelTracing extends BaseCallbackHandler {
         : {}),
       tokenUsage: structuredClone(tokenUsage),
       includeTokenUsageInAgentOutput: this.includeTokenUsageInAgentOutput,
+      includeIntermediateStepsInOutput: this.includeIntermediateStepsInOutput,
       ...(structuredOutput
         ? { structuredOutput: structuredClone(structuredOutput) }
         : {}),

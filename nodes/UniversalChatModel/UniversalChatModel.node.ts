@@ -47,12 +47,14 @@ interface ModelExecutionSettings {
 interface UsageReportingOptions {
   systemMessage?: string;
   includeTokenUsageInAgentOutput?: boolean;
+  includeIntermediateStepsInOutput?: boolean;
   enableUsageReporter?: boolean;
   nodeLabel?: string;
   inputTextMode?: 'label' | 'prompt';
   inputTextLabel?: string;
   includeOutputText?: boolean;
   failOnReporterError?: boolean;
+  reporterMaxWaitMs?: number;
   usageReporter?: {
     settings?: UsageReportingOptions & {
       enabled?: boolean;
@@ -135,6 +137,11 @@ async function createUsageReporter(
       : 'RAG';
   const includeOutputText = options.includeOutputText !== false;
   const failOnReporterError = options.failOnReporterError === true;
+  const reporterMaxWaitMs =
+    typeof options.reporterMaxWaitMs === 'number' &&
+    Number.isFinite(options.reporterMaxWaitMs)
+      ? Math.max(0, options.reporterMaxWaitMs)
+      : 1000;
 
   return async (event) => {
     const usage = event.tokenUsage;
@@ -173,10 +180,36 @@ async function createUsageReporter(
     try {
       // ToolWorkflow exposes func(), which preserves extra telemetry fields
       // even before they are added to the workflow input schema.
-      if (typeof reporterTool.func === 'function') {
-        await reporterTool.func(payload);
+      const reporterPromise = Promise.resolve().then(() =>
+        typeof reporterTool.func === 'function'
+          ? reporterTool.func(payload)
+          : reporterTool.invoke!(payload),
+      );
+
+      // Attach a handler immediately: if the timeout wins, the already-started
+      // report may still finish in the background without an unhandled rejection.
+      void reporterPromise.catch(() => undefined);
+
+      if (reporterMaxWaitMs === 0) {
+        await reporterPromise;
       } else {
-        await reporterTool.invoke!(payload);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            reporterPromise,
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => {
+                const timeoutError = new Error(
+                  `Usage Reporter exceeded the maximum wait of ${reporterMaxWaitMs} ms`,
+                );
+                timeoutError.name = 'UsageReporterTimeoutError';
+                reject(timeoutError);
+              }, reporterMaxWaitMs);
+            }),
+          ]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
       }
     } catch (error) {
       const reporterError =
@@ -212,9 +245,17 @@ function sharedModelOptions(): INodeProperties[] {
       displayName: 'Include Token Usage in Output',
       name: 'includeTokenUsageInAgentOutput',
       type: 'boolean',
-      default: true,
+      default: false,
       description:
         'Whether tokenUsage and raw usageMetadata are exposed in compatible parent-node outputs. Usage Reporter remains independent of this setting.',
+    },
+    {
+      displayName: 'Include Intermediate Steps in Output',
+      name: 'includeIntermediateStepsInOutput',
+      type: 'boolean',
+      default: false,
+      description:
+        'Whether compatible agent outputs include a compact list of tool steps. Internal LangChain messages and Gemini signatures are always removed.',
     },
     {
       displayName: 'Usage Reporter',
@@ -227,6 +268,7 @@ function sharedModelOptions(): INodeProperties[] {
           inputTextMode: 'label',
           inputTextLabel: 'RAG',
           includeOutputText: true,
+          reporterMaxWaitMs: 1000,
           failOnReporterError: false,
         },
       },
@@ -251,7 +293,7 @@ function sharedModelOptions(): INodeProperties[] {
               name: 'nodeLabel',
               type: 'string',
               default: '',
-              placeholder: 'e.g. Produtos Digitais',
+              placeholder: 'e.g. Customer Support',
               displayOptions: {
                 show: {
                   enabled: [true],
@@ -272,10 +314,10 @@ function sharedModelOptions(): INodeProperties[] {
                     'Send a fixed label instead of the potentially sensitive prompt.',
                 },
                 {
-                  name: 'Actual Prompt',
+                  name: 'Actual User Input',
                   value: 'prompt',
                   description:
-                    'Send the complete serialized model prompt to the reporter.',
+                    'Send only the latest human message. System prompts, tool calls, tool results, and previous AI messages are excluded.',
                 },
               ],
               default: 'label',
@@ -311,6 +353,23 @@ function sharedModelOptions(): INodeProperties[] {
               },
               description:
                 'Whether to send the generated response in output_text.',
+            },
+            {
+              displayName: 'Maximum Wait',
+              name: 'reporterMaxWaitMs',
+              type: 'number',
+              default: 1000,
+              typeOptions: {
+                minValue: 0,
+                numberStepSize: 100,
+              },
+              displayOptions: {
+                show: {
+                  enabled: [true],
+                },
+              },
+              description:
+                'Maximum milliseconds a model call waits for the reporter. After this limit, non-strict reporting continues in the background and no longer delays the parent node. Set 0 to wait indefinitely.',
             },
             {
               displayName: 'Fail Workflow if Reporter Fails',
@@ -353,7 +412,12 @@ function resolveSharedModelOptions(
       providerOptions.includeTokenUsageInAgentOutput ??
       (typeof legacy.includeTokenUsageInAgentOutput === 'boolean'
         ? legacy.includeTokenUsageInAgentOutput
-        : true),
+        : false),
+    includeIntermediateStepsInOutput:
+      providerOptions.includeIntermediateStepsInOutput ??
+      (typeof legacy.includeIntermediateStepsInOutput === 'boolean'
+        ? legacy.includeIntermediateStepsInOutput
+        : false),
     enableUsageReporter:
       groupedReporting.enabled ??
       providerOptions.enableUsageReporter ??
@@ -378,6 +442,10 @@ function resolveSharedModelOptions(
       groupedReporting.failOnReporterError ??
       providerOptions.failOnReporterError ??
       legacyReporting.failOnReporterError,
+    reporterMaxWaitMs:
+      groupedReporting.reporterMaxWaitMs ??
+      providerOptions.reporterMaxWaitMs ??
+      legacyReporting.reporterMaxWaitMs,
   };
 }
 
@@ -764,15 +832,33 @@ export function applySystemMessage(
 
   const inject = (messages: BaseMessage[]): BaseMessage[] => {
     const next = [...messages];
-    let insertAt = 0;
+    let systemCount = 0;
     while (
-      insertAt < next.length &&
-      typeof (next[insertAt] as any)?._getType === 'function' &&
-      (next[insertAt] as any)._getType() === 'system'
+      systemCount < next.length &&
+      typeof (next[systemCount] as any)?._getType === 'function' &&
+      (next[systemCount] as any)._getType() === 'system'
     ) {
-      insertAt += 1;
+      systemCount += 1;
     }
-    next.splice(insertAt, 0, new SystemMessage(content));
+
+    // Gemini accepts a single leading system instruction. Merge the parent
+    // node's system prompt and this optional node-level addition into that
+    // instruction while keeping them as separate text parts.
+    const systemParts: Array<Record<string, unknown>> = [];
+    for (const message of next.slice(0, systemCount)) {
+      const existingContent = (message as any).content;
+      if (typeof existingContent === 'string' && existingContent.length > 0) {
+        systemParts.push({ type: 'text', text: existingContent });
+      } else if (Array.isArray(existingContent)) {
+        systemParts.push(...existingContent);
+      }
+    }
+    systemParts.push({ type: 'text', text: content });
+    next.splice(
+      0,
+      systemCount,
+      new SystemMessage({ content: systemParts } as any),
+    );
     return next;
   };
 
@@ -1069,7 +1155,19 @@ export class UniversalChatModel implements INodeType {
             name: 'includeThoughts',
             type: 'boolean',
             default: false,
-            description: 'Return available thought summaries in model and AI Agent metadata. Thoughts remain hidden unless this option is enabled.',
+            description: 'Return available thought summaries in model and consumer metadata. Gemini may take longer to generate these summaries. Thoughts remain hidden unless this option is enabled.',
+          },
+          {
+            displayName: 'Model Request Timeout',
+            name: 'requestTimeoutMs',
+            type: 'number',
+            default: 60000,
+            typeOptions: {
+              minValue: 0,
+              maxValue: 900000,
+              numberStepSize: 1000,
+            },
+            description: 'Maximum milliseconds for each Gemini provider request. A timeout is retryable when Retry On Fail is enabled. Set 0 to disable the limit.',
           },
           {
             displayName: 'Recover Empty Final Responses',
@@ -1352,6 +1450,7 @@ export class UniversalChatModel implements INodeType {
         thinkingLevel?: string;
         thinkingBudget?: number;
         includeThoughts?: boolean;
+        requestTimeoutMs?: number;
         recoverEmptyResponses?: boolean;
         safetySettings?: { values?: Array<{ category: string; threshold: string }> };
       };
@@ -1448,6 +1547,7 @@ export class UniversalChatModel implements INodeType {
         model: geminiModel,
         maxRetries: 0,
         recoverEmptyResponses: opts.recoverEmptyResponses !== false,
+        requestTimeoutMs: opts.requestTimeoutMs ?? 60_000,
       };
       const usageReporter = await createUsageReporter(
         this,
@@ -1460,7 +1560,8 @@ export class UniversalChatModel implements INodeType {
           this,
           'gemini',
           shouldIncludeThoughts,
-          sharedOptions.includeTokenUsageInAgentOutput !== false,
+          sharedOptions.includeTokenUsageInAgentOutput === true,
+          sharedOptions.includeIntermediateStepsInOutput === true,
           usageReporter,
           sharedOptions.failOnReporterError === true,
         ),
@@ -1557,7 +1658,8 @@ export class UniversalChatModel implements INodeType {
           this,
           'openai_compatible',
           false,
-          sharedOptions.includeTokenUsageInAgentOutput !== false,
+          sharedOptions.includeTokenUsageInAgentOutput === true,
+          sharedOptions.includeIntermediateStepsInOutput === true,
           usageReporter,
           sharedOptions.failOnReporterError === true,
         ),

@@ -469,7 +469,23 @@ export function normalizeModelError(
   const nestedError = findNestedError(record);
   const cause = findCause(record);
   const statusCode = statusFrom(record, nestedError);
-  const status = apiStatusFrom(record, nestedError);
+  const explicitStatus = apiStatusFrom(record, nestedError);
+  const geminiStatusByHttpCode: Record<number, string> = {
+    400: 'INVALID_ARGUMENT',
+    401: 'UNAUTHENTICATED',
+    403: 'PERMISSION_DENIED',
+    404: 'NOT_FOUND',
+    408: 'DEADLINE_EXCEEDED',
+    429: 'RESOURCE_EXHAUSTED',
+    500: 'INTERNAL',
+    503: 'UNAVAILABLE',
+    504: 'DEADLINE_EXCEEDED',
+  };
+  const status =
+    explicitStatus ??
+    (provider === 'gemini' && statusCode !== undefined
+      ? geminiStatusByHttpCode[statusCode]
+      : undefined);
   const code = codeFrom(record, nestedError, cause);
   const name =
     stringValue(record.name) ??

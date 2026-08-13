@@ -1,6 +1,93 @@
 # Changelog
 
+## 1.0.33 — 2026-08-13
+
+- Corrige a exposição indevida de `tokenUsage` e `usageMetadata` no output de
+  nodes consumidores quando **Include Token Usage in Output** não foi ativado.
+- A exposição passa a exigir `true` explícito; ausente ou desativada, a opção
+  mantém o output limpo.
+- Mantém a contagem interna, o output diagnóstico do próprio Chat Model e o
+  Usage Reporter independentes dessa opção.
+
+## 1.0.32 — 2026-08-13
+
+- Adiciona **Model Request Timeout** para impedir que uma chamada do Gemini
+  mantenha o Agent preso indefinidamente; o padrão é 60 segundos e `0`
+  desativa o limite.
+- Trata timeout como falha transitória: quando **Retry On Fail** está ativo, a
+  próxima tentativa recebe uma requisição nova e independente.
+- Expõe `gemini.clientTiming` com o tempo gasto aguardando o provedor e no
+  pós-processamento local, facilitando diagnosticar caudas de latência.
+- Alinha `@google/generative-ai` exatamente à versão 0.24.0 usada pelo nó
+  Gemini nativo do n8n 2.32.x.
+- Documenta que **Include Thoughts** pede ao Gemini a geração de resumos de
+  pensamento e pode aumentar a latência da resposta.
+
+## 1.0.31 — 2026-08-13
+
+- Adiciona **Include Intermediate Steps in Output** às opções dos provedores.
+- Mantém `intermediateSteps` fora do output por padrão para evitar itens muito
+  grandes; quando ativado, expõe somente ferramenta, argumentos, log e
+  observação, removendo mensagens internas e assinaturas.
+- Restringe essa transformação aos agentes que realmente executaram o Universal
+  Chat Model, sem alterar workflows atendidos por outros Chat Models.
+
+## 1.0.30 — 2026-08-13
+
+- Mantém thought signatures e o `AIMessage` completo somente durante o ciclo
+  interno de ferramentas do agente.
+- Remove `messageLog`/`message_log` de `intermediateSteps` na saída pública do
+  AI Agent, evitando expor assinaturas do Gemini e a serialização interna do
+  LangChain (`lc_serializable`, `lc_kwargs` e outros metadados técnicos).
+- Preserva no output as informações úteis de cada etapa: nome da ferramenta,
+  argumentos, log da chamada e observação/resultado.
+
+## 1.0.29 — 2026-08-13
+
+- Migra o Gemini para `@langchain/google-genai` 2.1.24, o mesmo adaptador
+  oficial usado pelo nó nativo do n8n 2.32.x.
+- Preserva corretamente o histórico `usuário -> modelo/functionCall ->
+  functionResponse`, inclusive quando o AI Agent V3 reconstrói as mensagens
+  entre iterações.
+- Preserva thought signatures, chamadas sequenciais e paralelas, structured
+  output, streaming, thoughts e todos os metadados de tokens do Gemini.
+- Adiciona **Maximum Wait** ao Usage Reporter (1.000 ms por padrão): o reporte
+  já iniciado continua em segundo plano, mas não pode segurar o agente por
+  minutos quando um subworkflow ou banco de telemetria fica lento.
+- Mantém os status de erro canônicos do Gemini mesmo quando o SDK expõe apenas
+  o código HTTP.
+- Amplia a suíte para 70 testes, incluindo reconstrução realista do AI Agent e
+  reporter lento.
+
 Todas as mudanças relevantes deste projeto serão registradas aqui.
+
+## 1.0.28 — 2026-08-03
+
+- Corrige `input_text` no modo **Actual User Input** para enviar somente a
+  última mensagem humana, excluindo system prompts, tool calls, resultados de
+  ferramentas e mensagens anteriores da IA.
+- Captura function calls diretamente da resposta bruta do Gemini como fonte
+  autoritativa quando o callback do Agent remove ou substitui seus campos.
+- Adiciona suporte de observabilidade a `tool_call_chunks`, `contentBlocks`,
+  `generationInfo` e representações legadas OpenAI/LangChain.
+- Evita duplicar uma chamada quando o LangChain substitui o ID original do
+  Gemini por um ID interno de execução.
+- Amplia a suíte para 68 testes com regressão de system prompt, histórico de
+  tools, resposta bruta do Gemini e streaming.
+
+## 1.0.27 — 2026-08-03
+
+- Torna cada function call visível no output de execução do Chat Model, com
+  nome, argumentos e ID em um JSON compatível com o formato do Gemini.
+- Preenche `output_text` do Usage Reporter nas chamadas intermediárias que
+  contêm somente tools, inclusive chamadas paralelas e streaming.
+- Mantém o `AIMessage` original sem texto artificial: o AI Agent continua
+  recebendo e executando `tool_calls` estruturadas, sem confundi-las com a
+  resposta final ao usuário.
+- Normaliza chamadas nativas Gemini, LangChain e OpenAI-compatible e elimina
+  representações duplicadas da mesma chamada.
+- Amplia a suíte para 67 testes, incluindo múltiplas tools, DAX/Power BI,
+  Usage Reporter e streaming.
 
 ## 1.0.26 — 2026-07-31
 
