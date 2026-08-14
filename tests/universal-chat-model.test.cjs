@@ -1556,6 +1556,7 @@ test('Gemini Structured Output Schema is parsed and forces JSON responses', asyn
       answer: { type: 'string' },
       confidence: { type: 'number' },
     },
+    additionalProperties: false,
     required: ['answer'],
   };
   const parameters = {
@@ -1583,7 +1584,8 @@ test('Gemini Structured Output Schema is parsed and forces JSON responses', asyn
   const config = supplied.response.invocationParams({}).generationConfig;
 
   assert.equal(config.responseMimeType, 'application/json');
-  assert.deepEqual(config.responseSchema, schema);
+  assert.equal(config.responseSchema, undefined);
+  assert.deepEqual(config.responseJsonSchema, schema);
 });
 
 test('Gemini Structured Output Schema rejects invalid JSON before making a request', async () => {
@@ -1939,6 +1941,7 @@ test('Gemini binds structured tools created by the LangChain version in n8n 2.32
         properties: {
           message: { type: 'string' },
         },
+        additionalProperties: false,
         required: ['message'],
       },
     }).bindTools([tool]);
@@ -1959,11 +1962,13 @@ test('Gemini binds structured tools created by the LangChain version in n8n 2.32
       requestBody.generationConfig.responseMimeType,
       'application/json',
     );
-    assert.deepEqual(requestBody.generationConfig.responseSchema, {
+    assert.equal(requestBody.generationConfig.responseSchema, undefined);
+    assert.deepEqual(requestBody.generationConfig.responseJsonSchema, {
       type: 'object',
       properties: {
         message: { type: 'string' },
       },
+      additionalProperties: false,
       required: ['message'],
     });
   } finally {
@@ -4477,10 +4482,12 @@ test('AI Agent hides token usage by default while Usage Reporter still receives 
     const output = result[0][0].json;
 
     assert.equal(output.output, 'Resposta final limpa');
+    assert.equal(output.thoughts, undefined);
     assert.equal(output.tokenUsage, undefined);
     assert.equal(output.usageMetadata, undefined);
-    assert.equal(output.modelResponses[0].tokenUsage, undefined);
-    assert.equal(output.modelResponses[0].usageMetadata, undefined);
+    assert.equal(output.gemini, undefined);
+    assert.equal(output.modelCalls, undefined);
+    assert.equal(output.modelResponses, undefined);
     assert.equal(reports.length, 1);
     assert.equal(reports[0].input_token, 100);
     assert.equal(reports[0].output_token, 20);
@@ -4491,6 +4498,45 @@ test('AI Agent hides token usage by default while Usage Reporter still receives 
   } finally {
     global.fetch = originalFetch;
   }
+});
+
+test('AI Agent exposes only thoughts when token usage visibility is disabled', async () => {
+  const fixture = join(
+    __dirname,
+    'fixtures',
+    'n8n-nodes-langchain',
+    'dist',
+    'nodes',
+    'agents',
+    'Agent',
+    'V2',
+    'AgentV2.node.cjs',
+  );
+  const { AgentV2 } = require(fixture);
+  installAgentOutputBridge();
+
+  const agent = new AgentV2();
+  agent.run = async () => {
+    recordAgentModelMetadata({
+      thoughts: [{ text: 'Visible thought summary' }],
+      includeTokenUsageInAgentOutput: false,
+      tokenUsage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+      usageMetadata: { promptTokenCount: 10, totalTokenCount: 15 },
+      gemini: { modelVersion: 'gemini-test', responseId: 'response-test' },
+    });
+    return [[{ json: { output: 'Clean final response' } }]];
+  };
+
+  const result = await agent.execute();
+  const output = result[0][0].json;
+
+  assert.equal(output.output, 'Clean final response');
+  assert.deepEqual(output.thoughts, [{ text: 'Visible thought summary' }]);
+  assert.equal(output.tokenUsage, undefined);
+  assert.equal(output.usageMetadata, undefined);
+  assert.equal(output.gemini, undefined);
+  assert.equal(output.modelCalls, undefined);
+  assert.equal(output.modelResponses, undefined);
 });
 
 test('AI Agent optionally exposes compact intermediate steps without internal messages or Gemini signatures', async () => {

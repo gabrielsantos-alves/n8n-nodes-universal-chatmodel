@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.34 - 2026-08-13
+
+- Impede que `gemini`, `modelCalls` e `modelResponses` aparecam no output do
+  node consumidor quando **Include Token Usage in Output** estiver desativado.
+- Quando somente **Include Thoughts** estiver ativo, expoe apenas `thoughts`,
+  sem anexar telemetria adicional.
+- Mantem tracing e Usage Reporter completos, independentemente da visibilidade
+  escolhida para o output publico.
+- Envia Structured Output pelo campo moderno `responseJsonSchema`, preservando
+  `additionalProperties` e evitando o erro HTTP 400 do `responseSchema` legado.
+
 ## 1.0.33 — 2026-08-13
 
 - Corrige a exposição indevida de `tokenUsage` e `usageMetadata` no output de

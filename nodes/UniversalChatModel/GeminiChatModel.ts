@@ -973,7 +973,11 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
         generationConfig.thinkingConfig = this.explicitThinkingConfig;
       }
       if (this.explicitResponseSchema) {
-        generationConfig.responseSchema = this.explicitResponseSchema;
+        // responseSchema is the legacy OpenAPI subset and rejects valid JSON
+        // Schema keywords such as additionalProperties. responseJsonSchema is
+        // the generateContent field intended for JSON Schema payloads.
+        delete generationConfig.responseSchema;
+        generationConfig.responseJsonSchema = this.explicitResponseSchema;
         generationConfig.responseMimeType = 'application/json';
       } else if (this.explicitResponseMimeType) {
         generationConfig.responseMimeType = this.explicitResponseMimeType;

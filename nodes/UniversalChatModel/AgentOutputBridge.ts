@@ -151,22 +151,33 @@ function buildAgentOutputMetadata(
   );
   const lastCallWithVisibleUsage =
     callsWithVisibleUsage[callsWithVisibleUsage.length - 1];
-  const modelResponses = calls.map((call, index) => ({
-    call: index + 1,
-    ...(call.thoughts?.length
-      ? { thoughts: cloneValue(call.thoughts) }
-      : {}),
-    ...(call.includeTokenUsageInAgentOutput === true && call.tokenUsage
-      ? { tokenUsage: cloneValue(call.tokenUsage) }
-      : {}),
-    ...(call.includeTokenUsageInAgentOutput === true && call.usageMetadata
-      ? { usageMetadata: cloneValue(call.usageMetadata) }
-      : {}),
-    ...(call.gemini ? { gemini: cloneValue(call.gemini) } : {}),
-    ...(call.structuredOutput
-      ? { structuredOutput: cloneValue(call.structuredOutput) }
-      : {}),
-  }));
+
+  // Capturing metadata is always enabled internally so Usage Reporter and
+  // tracing remain complete. Public Agent output, however, must stay clean
+  // unless the corresponding visibility option was explicitly enabled.
+  const exposeUsage = callsWithVisibleUsage.length > 0;
+  if (thoughts.length === 0 && !exposeUsage) return undefined;
+
+  const modelResponses = exposeUsage
+    ? calls.map((call, index) => ({
+        call: index + 1,
+        ...(call.thoughts?.length
+          ? { thoughts: cloneValue(call.thoughts) }
+          : {}),
+        ...(call.includeTokenUsageInAgentOutput === true && call.tokenUsage
+          ? { tokenUsage: cloneValue(call.tokenUsage) }
+          : {}),
+        ...(call.includeTokenUsageInAgentOutput === true && call.usageMetadata
+          ? { usageMetadata: cloneValue(call.usageMetadata) }
+          : {}),
+        ...(call.includeTokenUsageInAgentOutput === true && call.gemini
+          ? { gemini: cloneValue(call.gemini) }
+          : {}),
+        ...(call.structuredOutput
+          ? { structuredOutput: cloneValue(call.structuredOutput) }
+          : {}),
+      }))
+    : [];
 
   return {
     ...(thoughts.length > 0 ? { thoughts: cloneValue(thoughts) as any[] } : {}),
@@ -176,9 +187,15 @@ function buildAgentOutputMetadata(
     ...(lastCallWithVisibleUsage?.usageMetadata
       ? { usageMetadata: cloneValue(lastCallWithVisibleUsage.usageMetadata) }
       : {}),
-    ...(lastCall.gemini ? { gemini: cloneValue(lastCall.gemini) } : {}),
-    modelCalls: calls.length,
-    modelResponses: cloneValue(modelResponses) as any[],
+    ...(exposeUsage && lastCall.gemini
+      ? { gemini: cloneValue(lastCall.gemini) }
+      : {}),
+    ...(exposeUsage
+      ? {
+          modelCalls: calls.length,
+          modelResponses: cloneValue(modelResponses) as any[],
+        }
+      : {}),
   };
 }
 
