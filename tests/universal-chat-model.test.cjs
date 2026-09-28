@@ -131,6 +131,7 @@ test('Gemini generation controls are optional collection entries', () => {
       'includeThoughts',
       'requestTimeoutMs',
       'recoverEmptyResponses',
+      'serviceTier',
       'safetySettings',
       'systemMessage',
       'includeTokenUsageInAgentOutput',
@@ -5331,3 +5332,166 @@ test('AI Agent keeps thought text hidden when Include Thoughts is disabled', asy
     global.fetch = originalFetch;
   }
 });
+
+test('UniversalChatModel node declares serviceTier in geminiOptions with standard, flex, and priority', () => {
+  const node = new UniversalChatModel();
+  const geminiOptionsProp = node.description.properties.find(
+    (prop) => prop.name === 'geminiOptions',
+  );
+  assert.ok(geminiOptionsProp, 'geminiOptions property must exist');
+  const serviceTierOption = geminiOptionsProp.options.find(
+    (opt) => opt.name === 'serviceTier',
+  );
+  assert.ok(serviceTierOption, 'serviceTier option must exist in geminiOptions');
+  assert.equal(serviceTierOption.type, 'options');
+  assert.equal(serviceTierOption.default, 'standard');
+  const values = serviceTierOption.options.map((item) => item.value);
+  assert.deepEqual(values, ['standard', 'flex', 'priority']);
+});
+
+test('UniversalChatModel supplyData passes configured serviceTier to GeminiChatModel and invocationParams', async () => {
+  const parameters = {
+    provider: 'gemini',
+    geminiModel: 'gemini-3.5-flash-lite',
+    geminiOptions: {
+      serviceTier: 'flex',
+    },
+  };
+  const context = {
+    getNodeParameter(name, _itemIndex, fallback) {
+      return parameters[name] ?? fallback;
+    },
+    async getCredentials() {
+      return { apiKey: 'test' };
+    },
+    getNode() {
+      return { parameters };
+    },
+    logAiEvent() {},
+  };
+
+  const supplied = await new UniversalChatModel().supplyData.call(context, 0);
+  const params = supplied.response.invocationParams({});
+  assert.equal(params.service_tier, 'flex');
+  assert.equal(params.serviceTier, undefined);
+  assert.equal(params.generationConfig?.service_tier, undefined);
+  assert.equal(params.generationConfig?.serviceTier, undefined);
+});
+
+test('GeminiChatModel sends service_tier in request payload and captures it in response metadata', async () => {
+  const originalFetch = global.fetch;
+  let requestBody;
+  global.fetch = async (request, init) => {
+    requestBody = await readFetchJson(request, init);
+    return new Response(
+      JSON.stringify({
+        candidates: [
+          {
+            content: {
+              role: 'model',
+              parts: [{ text: 'Flex response text' }],
+            },
+            finishReason: 'STOP',
+            index: 0,
+          },
+        ],
+        usageMetadata: {
+          promptTokenCount: 10,
+          candidatesTokenCount: 15,
+          totalTokenCount: 25,
+        },
+        modelVersion: 'gemini-3.5-flash-lite',
+        responseId: 'resp-service-tier-test',
+      }),
+      {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-gemini-service-tier': 'flex',
+        },
+      },
+    );
+  };
+
+  try {
+    const model = new GeminiChatModel({
+      apiKey: 'test',
+      model: 'gemini-3.5-flash-lite',
+      serviceTier: 'flex',
+    });
+
+    const response = await model.invoke('Teste de service tier');
+    assert.equal(response.text, 'Flex response text');
+    assert.ok(requestBody, 'Request body should have been captured');
+    assert.equal(requestBody.service_tier, 'flex');
+    assert.equal(requestBody.serviceTier, undefined);
+    assert.equal(requestBody.generationConfig?.service_tier, undefined);
+    assert.equal(requestBody.generationConfig?.serviceTier, undefined);
+    assert.equal(response.response_metadata.gemini.serviceTier, 'flex');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('GeminiChatModel streaming sends service_tier in root request payload without generationConfig contamination', async () => {
+  const originalFetch = global.fetch;
+  let requestBody;
+  global.fetch = async (request, init) => {
+    requestBody = await readFetchJson(request, init);
+    const sseChunk =
+      'data: ' +
+      JSON.stringify({
+        candidates: [
+          {
+            content: {
+              role: 'model',
+              parts: [{ text: 'Streamed flex chunk' }],
+            },
+            finishReason: 'STOP',
+            index: 0,
+          },
+        ],
+        usageMetadata: {
+          promptTokenCount: 8,
+          candidatesTokenCount: 12,
+          totalTokenCount: 20,
+        },
+        modelVersion: 'gemini-3.8-flash',
+        responseId: 'resp-stream-tier-test',
+      }) +
+      '\n\n';
+
+    return new Response(sseChunk, {
+      status: 200,
+      headers: {
+        'content-type': 'text/event-stream',
+      },
+    });
+  };
+
+  try {
+    const model = new GeminiChatModel({
+      apiKey: 'test',
+      model: 'gemini-3.8-flash',
+      serviceTier: 'flex',
+    });
+
+    const stream = await model.stream('Teste stream flex');
+    const chunks = [];
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+
+    assert.ok(chunks.length > 0, 'Stream should yield chunks');
+    assert.equal(chunks[0].text, 'Streamed flex chunk');
+    assert.ok(requestBody, 'Request body should have been captured');
+    assert.equal(requestBody.service_tier, 'flex');
+    assert.equal(requestBody.serviceTier, undefined);
+    assert.equal(requestBody.generationConfig?.service_tier, undefined);
+    assert.equal(requestBody.generationConfig?.serviceTier, undefined);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+

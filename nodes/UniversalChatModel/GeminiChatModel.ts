@@ -31,6 +31,7 @@ export interface GeminiResponseMetadata {
   promptFeedback?: unknown;
   thoughts?: unknown[];
   functionCalls?: unknown[];
+  serviceTier?: string;
   [key: string]: unknown;
 }
 
@@ -192,7 +193,7 @@ function mergeUniqueFunctionCalls(existing: unknown, incoming: unknown[]): unkno
   });
 }
 
-function capturePayload(payload: unknown): void {
+function capturePayload(payload: unknown, defaultServiceTier?: string): void {
   if (!payload || typeof payload !== 'object') return;
 
   const source = payload as GeminiResponseMetadata;
@@ -242,12 +243,20 @@ function capturePayload(payload: unknown): void {
     }
   }
 
+  const resolvedServiceTier =
+    typeof source.serviceTier === 'string' && source.serviceTier.trim().length > 0
+      ? source.serviceTier.trim()
+      : typeof (source as any).service_tier === 'string' && (source as any).service_tier.trim().length > 0
+        ? (source as any).service_tier.trim()
+        : defaultServiceTier;
+
   context.response = {
     ...previous,
     ...(source.modelVersion !== undefined ? { modelVersion: source.modelVersion } : {}),
     ...(source.responseId !== undefined ? { responseId: source.responseId } : {}),
     ...(source.modelStatus !== undefined ? { modelStatus: source.modelStatus } : {}),
     ...(source.promptFeedback !== undefined ? { promptFeedback: source.promptFeedback } : {}),
+    ...(resolvedServiceTier !== undefined ? { serviceTier: resolvedServiceTier } : {}),
     ...(source.usageMetadata !== undefined
       ? { usageMetadata: structuredClone(source.usageMetadata) }
       : {}),
@@ -859,6 +868,7 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
   private readonly includeThoughts: boolean;
   private readonly recoverEmptyResponses: boolean;
   private readonly requestTimeoutMs: number;
+  private readonly serviceTier?: string;
 
   constructor(fields: Record<string, unknown>, onUsage?: (metadata: GeminiUsageMetadata) => void) {
     super({
@@ -866,6 +876,10 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
       model: String(fields.model ?? ''),
     } as any);
     this.onUsage = onUsage;
+    this.serviceTier =
+      typeof fields.serviceTier === 'string' && fields.serviceTier.trim().length > 0
+        ? fields.serviceTier.trim()
+        : undefined;
     this.explicitThinkingConfig =
       fields.thinkingConfig && typeof fields.thinkingConfig === 'object'
         ? (fields.thinkingConfig as Record<string, unknown>)
@@ -886,10 +900,26 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
     // Capture raw metadata while retaining the same official Google client
     // used by n8n's native Gemini Chat Model. Replacing the transport breaks
     // reconstruction of model/function-call/function-response histories.
+    if ((this as any).client?.generationConfig) {
+      delete (this as any).client.generationConfig.service_tier;
+      delete (this as any).client.generationConfig.serviceTier;
+    }
+
     const client = (this as any).client;
     if (client && typeof client.generateContent === 'function') {
       const generateContent = client.generateContent.bind(client);
       client.generateContent = async (...args: unknown[]) => {
+        if (args[0] && typeof args[0] === 'object') {
+          const req = args[0] as Record<string, unknown>;
+          delete req.serviceTier;
+          if (this.serviceTier) {
+            req.service_tier = this.serviceTier;
+          }
+          if (req.generationConfig && typeof req.generationConfig === 'object') {
+            delete (req.generationConfig as any).service_tier;
+            delete (req.generationConfig as any).serviceTier;
+          }
+        }
         const request = timedRequestOptions(args[1], this.requestTimeoutMs);
         const startedAt = Date.now();
         try {
@@ -897,7 +927,7 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
           const context = responseCapture.getStore();
           if (context) context.providerRequestMs += Date.now() - startedAt;
           const captureStartedAt = Date.now();
-          capturePayload(result?.response);
+          capturePayload(result?.response, this.serviceTier);
           if (context) context.metadataCaptureMs += Date.now() - captureStartedAt;
           return result;
         } catch (error) {
@@ -913,6 +943,17 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
     if (client && typeof client.generateContentStream === 'function') {
       const generateContentStream = client.generateContentStream.bind(client);
       client.generateContentStream = async (...args: unknown[]) => {
+        if (args[0] && typeof args[0] === 'object') {
+          const req = args[0] as Record<string, unknown>;
+          delete req.serviceTier;
+          if (this.serviceTier) {
+            req.service_tier = this.serviceTier;
+          }
+          if (req.generationConfig && typeof req.generationConfig === 'object') {
+            delete (req.generationConfig as any).service_tier;
+            delete (req.generationConfig as any).serviceTier;
+          }
+        }
         const requestTimeoutMs = this.requestTimeoutMs;
         const request = timedRequestOptions(args[1], requestTimeoutMs);
         const startedAt = Date.now();
@@ -932,6 +973,7 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
           return result;
         }
         const originalStream = result.stream as AsyncIterable<unknown>;
+        const serviceTier = this.serviceTier;
         return {
           ...result,
           stream: {
@@ -940,7 +982,7 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
                 for await (const response of originalStream) {
                   const captureStartedAt = Date.now();
                   if (context) {
-                    responseCapture.run(context, () => capturePayload(response));
+                    responseCapture.run(context, () => capturePayload(response, serviceTier));
                     context.metadataCaptureMs += Date.now() - captureStartedAt;
                   }
                   yield response;
@@ -966,6 +1008,8 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
     const generationConfig = (this as any).client?.generationConfig;
 
     if (generationConfig) {
+      delete (generationConfig as any).service_tier;
+      delete (generationConfig as any).serviceTier;
       if (
         this.explicitThinkingConfig &&
         Object.keys(this.explicitThinkingConfig).length > 0
@@ -986,6 +1030,7 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
 
     return {
       ...params,
+      ...(this.serviceTier ? { service_tier: this.serviceTier } : {}),
       ...(generationConfig
         ? { generationConfig: { ...generationConfig } }
         : {}),
