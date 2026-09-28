@@ -31,11 +31,22 @@ export interface GeminiResponseMetadata {
   promptFeedback?: unknown;
   thoughts?: unknown[];
   functionCalls?: unknown[];
+  serviceTier?: string;
+  requestDetails?: GeminiRequestDetail[];
   [key: string]: unknown;
+}
+
+export interface GeminiRequestDetail {
+  model: string;
+  request: Record<string, unknown>;
+  response?: unknown;
+  responseChunks?: unknown[];
+  usageMetadata?: GeminiUsageMetadata;
 }
 
 interface CaptureContext {
   response?: GeminiResponseMetadata;
+  requestDetails: GeminiRequestDetail[];
   finishReasons: string[];
   finishMessages: string[];
   hasFunctionCall: boolean;
@@ -192,12 +203,17 @@ function mergeUniqueFunctionCalls(existing: unknown, incoming: unknown[]): unkno
   });
 }
 
-function capturePayload(payload: unknown): void {
+function capturePayload(payload: unknown, defaultServiceTier?: string): void {
   if (!payload || typeof payload !== 'object') return;
 
   const source = payload as GeminiResponseMetadata;
   const context = responseCapture.getStore();
   if (!context) return;
+
+  if (source.usageMetadata && context.requestDetails.length > 0) {
+    context.requestDetails[context.requestDetails.length - 1].usageMetadata =
+      structuredClone(source.usageMetadata);
+  }
 
   const previous = context.response ?? {};
   const capturedThoughts = extractRawThoughts(payload);
@@ -242,12 +258,20 @@ function capturePayload(payload: unknown): void {
     }
   }
 
+  const resolvedServiceTier =
+    typeof source.serviceTier === 'string' && source.serviceTier.trim().length > 0
+      ? source.serviceTier.trim()
+      : typeof (source as any).service_tier === 'string' && (source as any).service_tier.trim().length > 0
+        ? (source as any).service_tier.trim()
+        : defaultServiceTier;
+
   context.response = {
     ...previous,
     ...(source.modelVersion !== undefined ? { modelVersion: source.modelVersion } : {}),
     ...(source.responseId !== undefined ? { responseId: source.responseId } : {}),
     ...(source.modelStatus !== undefined ? { modelStatus: source.modelStatus } : {}),
     ...(source.promptFeedback !== undefined ? { promptFeedback: source.promptFeedback } : {}),
+    ...(resolvedServiceTier !== undefined ? { serviceTier: resolvedServiceTier } : {}),
     ...(source.usageMetadata !== undefined
       ? { usageMetadata: structuredClone(source.usageMetadata) }
       : {}),
@@ -272,6 +296,7 @@ function capturePayload(payload: unknown): void {
 
 function createCaptureContext(): CaptureContext {
   return {
+    requestDetails: [],
     finishReasons: [],
     finishMessages: [],
     hasFunctionCall: false,
@@ -281,6 +306,42 @@ function createCaptureContext(): CaptureContext {
     metadataCaptureMs: 0,
     adapterTotalMs: 0,
   };
+}
+
+function jsonSnapshot<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function effectiveRequest(client: any, params: unknown): Record<string, unknown> {
+  const request = asRecord(params) ?? {};
+  // The Google SDK merges model defaults with the per-call request before
+  // serializing the HTTP body. Capture that merged body, without the API key.
+  return jsonSnapshot({
+    generationConfig: client.generationConfig,
+    safetySettings: client.safetySettings,
+    tools: client.tools,
+    toolConfig: client.toolConfig,
+    systemInstruction: client.systemInstruction,
+    cachedContent: client.cachedContent?.name,
+    ...request,
+  });
+}
+
+function diagnosticResponse(payload: unknown, includeThoughts: boolean): unknown {
+  const response = jsonSnapshot(payload);
+  if (includeThoughts) return response;
+  const record = asRecord(response);
+  const candidates = Array.isArray(record?.candidates) ? record.candidates : [];
+  for (const candidate of candidates) {
+    const content = asRecord(asRecord(candidate)?.content);
+    if (Array.isArray(content?.parts)) {
+      content.parts = content.parts.filter((part) => normalizeRawThoughtPart(part).length === 0);
+    }
+  }
+  if (Array.isArray(record?.steps)) {
+    record.steps = record.steps.filter((step) => asRecord(step)?.type !== 'thought');
+  }
+  return response;
 }
 
 function requestTimeoutError(timeoutMs: number, cause?: unknown): Error {
@@ -639,6 +700,13 @@ function mergeResponseMetadata(
   const merged: GeminiResponseMetadata = {
     ...structuredClone(responses.at(-1)!),
     ...(usageMetadata ? { usageMetadata } : {}),
+    ...(contexts.some((context) => context.requestDetails.length > 0)
+      ? {
+          requestDetails: structuredClone(
+            contexts.flatMap((context) => context.requestDetails),
+          ),
+        }
+      : {}),
     ...(thoughts.length > 0 ? { thoughts } : {}),
     ...(functionCalls.length > 0 ? { functionCalls } : {}),
     ...(adapterTotalMs > 0
@@ -857,8 +925,10 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
   private readonly explicitResponseMimeType?: string;
   private readonly explicitResponseSchema?: Record<string, unknown>;
   private readonly includeThoughts: boolean;
+  private readonly includeRequestDetailsInOutput: boolean;
   private readonly recoverEmptyResponses: boolean;
   private readonly requestTimeoutMs: number;
+  private readonly serviceTier?: string;
 
   constructor(fields: Record<string, unknown>, onUsage?: (metadata: GeminiUsageMetadata) => void) {
     super({
@@ -866,11 +936,16 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
       model: String(fields.model ?? ''),
     } as any);
     this.onUsage = onUsage;
+    this.serviceTier =
+      typeof fields.serviceTier === 'string' && fields.serviceTier.trim().length > 0
+        ? fields.serviceTier.trim()
+        : undefined;
     this.explicitThinkingConfig =
       fields.thinkingConfig && typeof fields.thinkingConfig === 'object'
         ? (fields.thinkingConfig as Record<string, unknown>)
         : undefined;
     this.includeThoughts = this.explicitThinkingConfig?.includeThoughts === true;
+    this.includeRequestDetailsInOutput = fields.includeRequestDetailsInOutput === true;
     this.recoverEmptyResponses = fields.recoverEmptyResponses !== false;
     const configuredTimeout = Number(fields.requestTimeoutMs ?? 60_000);
     this.requestTimeoutMs = Number.isFinite(configuredTimeout)
@@ -886,18 +961,44 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
     // Capture raw metadata while retaining the same official Google client
     // used by n8n's native Gemini Chat Model. Replacing the transport breaks
     // reconstruction of model/function-call/function-response histories.
+    if ((this as any).client?.generationConfig) {
+      delete (this as any).client.generationConfig.service_tier;
+      delete (this as any).client.generationConfig.serviceTier;
+    }
+
     const client = (this as any).client;
     if (client && typeof client.generateContent === 'function') {
       const generateContent = client.generateContent.bind(client);
       client.generateContent = async (...args: unknown[]) => {
+        if (args[0] && typeof args[0] === 'object') {
+          const req = args[0] as Record<string, unknown>;
+          delete req.serviceTier;
+          if (this.serviceTier) {
+            req.service_tier = this.serviceTier;
+          }
+          if (req.generationConfig && typeof req.generationConfig === 'object') {
+            delete (req.generationConfig as any).service_tier;
+            delete (req.generationConfig as any).serviceTier;
+          }
+        }
+        const context = responseCapture.getStore();
+        const requestDetail = this.includeRequestDetailsInOutput && context
+          ? {
+              model: this.model,
+              request: effectiveRequest(client, args[0]),
+            } as GeminiRequestDetail
+          : undefined;
+        if (requestDetail) context!.requestDetails.push(requestDetail);
         const request = timedRequestOptions(args[1], this.requestTimeoutMs);
         const startedAt = Date.now();
         try {
           const result = await generateContent(args[0], request.options);
-          const context = responseCapture.getStore();
+          if (requestDetail && result?.response) {
+            requestDetail.response = diagnosticResponse(result?.response, this.includeThoughts);
+          }
           if (context) context.providerRequestMs += Date.now() - startedAt;
           const captureStartedAt = Date.now();
-          capturePayload(result?.response);
+          capturePayload(result?.response, this.serviceTier);
           if (context) context.metadataCaptureMs += Date.now() - captureStartedAt;
           return result;
         } catch (error) {
@@ -913,6 +1014,26 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
     if (client && typeof client.generateContentStream === 'function') {
       const generateContentStream = client.generateContentStream.bind(client);
       client.generateContentStream = async (...args: unknown[]) => {
+        if (args[0] && typeof args[0] === 'object') {
+          const req = args[0] as Record<string, unknown>;
+          delete req.serviceTier;
+          if (this.serviceTier) {
+            req.service_tier = this.serviceTier;
+          }
+          if (req.generationConfig && typeof req.generationConfig === 'object') {
+            delete (req.generationConfig as any).service_tier;
+            delete (req.generationConfig as any).serviceTier;
+          }
+        }
+        const context = responseCapture.getStore();
+        const requestDetail = this.includeRequestDetailsInOutput && context
+          ? {
+              model: this.model,
+              request: effectiveRequest(client, args[0]),
+              responseChunks: [],
+            } as GeminiRequestDetail
+          : undefined;
+        if (requestDetail) context!.requestDetails.push(requestDetail);
         const requestTimeoutMs = this.requestTimeoutMs;
         const request = timedRequestOptions(args[1], requestTimeoutMs);
         const startedAt = Date.now();
@@ -926,12 +1047,13 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
           }
           throw error;
         }
-        const context = responseCapture.getStore();
         if (!result?.stream) {
           request.cleanup();
           return result;
         }
         const originalStream = result.stream as AsyncIterable<unknown>;
+        const serviceTier = this.serviceTier;
+        const includeThoughts = this.includeThoughts;
         return {
           ...result,
           stream: {
@@ -940,7 +1062,12 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
                 for await (const response of originalStream) {
                   const captureStartedAt = Date.now();
                   if (context) {
-                    responseCapture.run(context, () => capturePayload(response));
+                    if (requestDetail?.responseChunks) {
+                      requestDetail.responseChunks.push(
+                        diagnosticResponse(response, includeThoughts),
+                      );
+                    }
+                    responseCapture.run(context, () => capturePayload(response, serviceTier));
                     context.metadataCaptureMs += Date.now() - captureStartedAt;
                   }
                   yield response;
@@ -966,6 +1093,8 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
     const generationConfig = (this as any).client?.generationConfig;
 
     if (generationConfig) {
+      delete (generationConfig as any).service_tier;
+      delete (generationConfig as any).serviceTier;
       if (
         this.explicitThinkingConfig &&
         Object.keys(this.explicitThinkingConfig).length > 0
@@ -986,6 +1115,7 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
 
     return {
       ...params,
+      ...(this.serviceTier ? { service_tier: this.serviceTier } : {}),
       ...(generationConfig
         ? { generationConfig: { ...generationConfig } }
         : {}),
@@ -1087,7 +1217,16 @@ export class GeminiChatModel extends ChatGoogleGenerativeAI {
 
       if (pending) {
         if (context.response) {
-          augmentMessage(pending.message, context.response, model.includeThoughts);
+          augmentMessage(
+            pending.message,
+            context.requestDetails.length > 0
+              ? {
+                  ...context.response,
+                  requestDetails: structuredClone(context.requestDetails),
+                }
+              : context.response,
+            model.includeThoughts,
+          );
         } else if (!model.includeThoughts) {
           hideThoughts(pending.message);
         }

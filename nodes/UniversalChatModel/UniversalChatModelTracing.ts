@@ -8,7 +8,7 @@ import {
   type ISupplyDataFunctions,
 } from 'n8n-workflow';
 
-import type { GeminiResponseMetadata, GeminiUsageMetadata } from './GeminiChatModel';
+import type { GeminiRequestDetail, GeminiResponseMetadata, GeminiUsageMetadata } from './GeminiChatModel';
 import { recordAgentModelMetadata } from './AgentOutputBridge';
 import {
   type ModelProvider,
@@ -476,6 +476,7 @@ function compactGeminiMetadata(
     usageMetadata: _usageMetadata,
     tokenUsage: _tokenUsage,
     thoughts: _thoughts,
+    requestDetails: _requestDetails,
     ...metadata
   } = gemini as GeminiResponseMetadata & { tokenUsage?: unknown };
 
@@ -552,6 +553,9 @@ export class UniversalChatModelTracing extends BaseCallbackHandler {
     };
     const gemini = findGeminiMetadata(output);
     const geminiMetadata = compactGeminiMetadata(gemini);
+    const geminiRequests = Array.isArray(gemini?.requestDetails)
+      ? structuredClone(gemini.requestDetails) as GeminiRequestDetail[]
+      : undefined;
     const thoughts = this.includeThoughts
       ? extractThoughtsFromResult(output)
       : [];
@@ -596,6 +600,7 @@ export class UniversalChatModelTracing extends BaseCallbackHandler {
         ? { usageMetadata: structuredClone(gemini.usageMetadata) as IDataObject }
         : {}),
       ...(geminiMetadata ? { gemini: geminiMetadata } : {}),
+      ...(geminiRequests ? { geminiRequests: geminiRequests as unknown as IDataObject[] } : {}),
     };
 
     recordAgentModelMetadata({
@@ -613,6 +618,9 @@ export class UniversalChatModelTracing extends BaseCallbackHandler {
         : {}),
       ...(geminiMetadata
         ? { gemini: structuredClone(geminiMetadata) as IDataObject }
+        : {}),
+      ...(geminiRequests
+        ? { geminiRequests: structuredClone(geminiRequests) as unknown as IDataObject[] }
         : {}),
     });
 

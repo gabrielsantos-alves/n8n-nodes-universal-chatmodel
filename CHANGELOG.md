@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.0.37 - 2026-09-28
+
+- Adiciona a opção Gemini **Include Gemini Request Details in Output** para
+  mostrar no AI Agent o corpo completo enviado e a resposta recebida por
+  requisição, inclusive streaming e recuperação de resposta vazia.
+- Mantém `usageMetadata` individual por requisição e separa requisições
+  múltiplas por chamada do modelo em `geminiRequests`.
+- Preserva a privacidade de resumos de pensamento quando **Include Thoughts**
+  está desativado.
+
+## 1.0.36 - 2026-09-28
+
+- Reforça a integração com AI Agent V1/V2/V3 quando o n8n carrega o Agent
+  antes do community node: a captura de `tokenUsage` também intercepta o
+  executor delegado pelo Agent.
+- Adiciona regressão para a ordem de carregamento em que `execute` já foi
+  retido pelo runtime.
+
+## 1.0.35 - 2026-09-28
+
+- Adiciona **Service Tier** para Gemini (`standard`, `flex`, `priority`) e envia
+  `service_tier` no corpo da requisição, inclusive no streaming.
+- Registra o tier selecionado nos metadados da resposta Gemini.
+
 ## 1.0.34 - 2026-08-13
 
 - Impede que `gemini`, `modelCalls` e `modelResponses` aparecam no output do

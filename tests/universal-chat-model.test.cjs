@@ -129,8 +129,10 @@ test('Gemini generation controls are optional collection entries', () => {
       'thinkingLevel',
       'thinkingBudget',
       'includeThoughts',
+      'includeRequestDetailsInOutput',
       'requestTimeoutMs',
       'recoverEmptyResponses',
+      'serviceTier',
       'safetySettings',
       'systemMessage',
       'includeTokenUsageInAgentOutput',
@@ -2459,6 +2461,7 @@ test('Gemini automatically recovers one truly empty STOP response and aggregates
       {
         apiKey: 'test',
         model: 'gemini-3.6-flash',
+        includeRequestDetailsInOutput: true,
       },
       (usage) => reportedUsage.push(usage),
     );
@@ -2468,6 +2471,13 @@ test('Gemini automatically recovers one truly empty STOP response and aggregates
 
     assert.equal(response.text, 'Resposta final recuperada.');
     assert.equal(requestBodies.length, 2);
+    const requestDetails = response.response_metadata.gemini.requestDetails;
+    assert.equal(requestDetails.length, 2);
+    assert.deepEqual(requestDetails.map((detail) => detail.request), requestBodies);
+    assert.deepEqual(requestDetails.map((detail) => detail.response.responseId),
+      ['empty-response', 'recovered-response']);
+    assert.deepEqual(requestDetails.map((detail) => detail.usageMetadata.promptTokenCount),
+      [17024, 17062]);
     assert.match(
       JSON.stringify(requestBodies[1]),
       /previous model turn ended with STOP/,
@@ -2989,6 +2999,7 @@ test('Gemini streaming interoperates with n8n 2.32.6 and keeps final usage metad
       apiKey: 'test',
       model: 'gemini-2.5-flash',
       thinkingConfig: { thinkingBudget: 256, includeThoughts: true },
+      includeRequestDetailsInOutput: true,
     });
     const chunks = [];
     const stream = await model.stream([
@@ -3011,6 +3022,12 @@ test('Gemini streaming interoperates with n8n 2.32.6 and keeps final usage metad
     );
     assert.equal(chunkWithUsage.response_metadata.thoughts[0].thought, true);
     assert.deepEqual(chunkWithUsage.response_metadata.gemini.usageMetadata, usageMetadata);
+    const requestDetails = chunkWithUsage.response_metadata.gemini.requestDetails;
+    assert.equal(requestDetails.length, 1);
+    assert.equal(requestDetails[0].request.contents[0].parts[0].text,
+      'stream criado pelo LangChain do n8n 2.32.6');
+    assert.equal(requestDetails[0].responseChunks[0].responseId, 'response-test');
+    assert.deepEqual(requestDetails[0].usageMetadata, usageMetadata);
     assert.equal(chunkWithUsage.usage_metadata.input_token_details.tool_use, 7);
     assert.equal(chunkWithUsage.usage_metadata.output_token_details.reasoning, 13);
   } finally {
@@ -4397,6 +4414,91 @@ test('AI Agent output receives separate thoughts and aggregated model metadata',
   }
 });
 
+test('Gemini request diagnostics expose each exact provider body and response in AI Agent output', async () => {
+  const originalFetch = global.fetch;
+  const sentBodies = [];
+  global.fetch = async (request, init) => {
+    sentBodies.push(await readFetchJson(request, init));
+    return new Response(JSON.stringify({
+      ...makeGeminiResponse(),
+      steps: [{ type: 'thought', summary: [{ text: 'Outro pensamento' }] }],
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  const parameters = {
+    provider: 'gemini',
+    geminiModel: 'gemini-2.5-flash',
+    geminiOptions: {
+      systemMessage: 'Instrução de sistema privada',
+      includeRequestDetailsInOutput: true,
+    },
+  };
+  const context = {
+    getNodeParameter(name, _itemIndex, fallback) {
+      return parameters[name] ?? fallback;
+    },
+    async getCredentials() {
+      return { apiKey: 'test' };
+    },
+    getNode() {
+      return { name: 'Universal Chat Model', parameters };
+    },
+    addInputData() {
+      return { index: 0 };
+    },
+    addOutputData() {},
+    getNextRunIndex() {
+      return 0;
+    },
+    logAiEvent() {},
+  };
+  const fixture = join(
+    __dirname, 'fixtures', 'n8n-nodes-langchain', 'dist',
+    'nodes', 'agents', 'Agent', 'V2', 'AgentV2.node.cjs',
+  );
+  const { AgentV2 } = require(fixture);
+  installAgentOutputBridge();
+
+  try {
+    const supplied = await new UniversalChatModel().supplyData.call(context, 0);
+    const agent = new AgentV2();
+    agent.run = async () => {
+      await supplied.response.invoke('primeiro prompt');
+      await supplied.response.invoke('segundo prompt');
+      return [[{ json: { output: 'Resposta final' } }]];
+    };
+
+    const output = (await agent.execute())[0][0].json;
+    assert.equal(output.output, 'Resposta final');
+    assert.equal(sentBodies.length, 2);
+    assert.equal(output.geminiRequests.length, 2);
+    for (const [index, detail] of output.geminiRequests.entries()) {
+      assert.equal(detail.call, index + 1);
+      assert.equal(detail.requestNumber, 1);
+      assert.equal(detail.model, 'gemini-2.5-flash');
+      assert.deepEqual(detail.request, sentBodies[index]);
+      assert.deepEqual(detail.usageMetadata, usageMetadata);
+      assert.equal(detail.response.responseId, 'response-test');
+      assert.deepEqual(detail.response.steps, []);
+      assert.deepEqual(detail.response.candidates[0].content.parts, [
+        { text: 'Resposta final', thoughtSignature: 'signature' },
+      ]);
+    }
+    assert.equal(output.geminiRequests[0].request.systemInstruction.parts[0].text,
+      'Instrução de sistema privada');
+    assert.equal(output.geminiRequests[0].request.contents[0].parts[0].text,
+      'primeiro prompt');
+    assert.equal(output.geminiRequests[1].request.contents[0].parts[0].text,
+      'segundo prompt');
+    assert.equal(output.tokenUsage.inputTokens, 200);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('AI Agent hides token usage by default while Usage Reporter still receives it', async () => {
   const originalFetch = global.fetch;
   global.fetch = async () =>
@@ -4486,6 +4588,7 @@ test('AI Agent hides token usage by default while Usage Reporter still receives 
     assert.equal(output.tokenUsage, undefined);
     assert.equal(output.usageMetadata, undefined);
     assert.equal(output.gemini, undefined);
+    assert.equal(output.geminiRequests, undefined);
     assert.equal(output.modelCalls, undefined);
     assert.equal(output.modelResponses, undefined);
     assert.equal(reports.length, 1);
@@ -4729,6 +4832,47 @@ test('AI Agent loaded after the community node still receives metadata', async (
   assert.equal(output.modelCalls, 1);
 });
 
+test('AI Agent keeps token usage when its execute method was retained before the bridge loaded', () => {
+  const fixture = join(
+    __dirname, 'fixtures', 'n8n-nodes-langchain', 'dist', 'nodes',
+    'agents', 'Agent', 'V2', 'AgentV2.node.js',
+  );
+  const bridge = join(
+    __dirname, '..', 'dist', 'nodes', 'UniversalChatModel', 'AgentOutputBridge.js',
+  );
+  const script = `
+    const { AgentV2 } = require(${JSON.stringify(fixture)});
+    const retainedExecute = AgentV2.prototype.execute;
+    const { recordAgentModelMetadata } = require(${JSON.stringify(bridge)});
+    const agent = new AgentV2();
+    agent.run = async () => {
+      recordAgentModelMetadata({
+        includeTokenUsageInAgentOutput: true,
+        tokenUsage: { inputTokens: 12, outputTokens: 5, totalTokens: 17 },
+      });
+      return [[{ json: { output: 'Ready' } }]];
+    };
+    retainedExecute.call(agent).then(async (result) => {
+      const normalResult = await agent.execute();
+      process.stdout.write(JSON.stringify({
+        retained: result[0][0].json,
+        normal: normalResult[0][0].json,
+      }));
+    }).catch((error) => { console.error(error); process.exitCode = 1; });
+  `;
+  const output = JSON.parse(execFileSync(process.execPath, ['-e', script], {
+    encoding: 'utf8',
+  }));
+
+  for (const result of [output.retained, output.normal]) {
+    assert.equal(result.output, 'Ready');
+    assert.equal(result.tokenUsage.inputTokens, 12);
+    assert.equal(result.tokenUsage.outputTokens, 5);
+    assert.equal(result.tokenUsage.totalTokens, 17);
+    assert.equal(result.modelCalls, 1);
+  }
+});
+
 test('AI Agent promotes Structured Output JSON into separate output fields', async () => {
   const fixture = join(
     __dirname,
@@ -4895,6 +5039,11 @@ test('AI Agent V3 preserves metadata across tool-call iterations', async () => {
   agent.run = async (response) => {
     recordAgentModelMetadata({
       includeTokenUsageInAgentOutput: true,
+      geminiRequests: [{
+        model: 'gemini-2.5-flash',
+        request: { contents: [{ parts: [{ text: response ? 'after tool' : 'before tool' }] }] },
+        usageMetadata: { promptTokenCount: 10 },
+      }],
       tokenUsage: {
         inputTokens: 10,
         inputUncachedTokens: 8,
@@ -4930,6 +5079,14 @@ test('AI Agent V3 preserves metadata across tool-call iterations', async () => {
   assert.equal(output.tokenUsage.toolUsePromptTokens, 2);
   assert.equal(output.tokenUsage.thoughtsTokens, 6);
   assert.equal(output.tokenUsage.totalTokens, 34);
+  assert.deepEqual(output.geminiRequests.map((detail) => ({
+    call: detail.call,
+    requestNumber: detail.requestNumber,
+    prompt: detail.request.contents[0].parts[0].text,
+  })), [
+    { call: 1, requestNumber: 1, prompt: 'before tool' },
+    { call: 2, requestNumber: 1, prompt: 'after tool' },
+  ]);
 });
 
 test('Usage Reporter can fail the workflow without repeating a successful model call', async () => {
@@ -5331,3 +5488,166 @@ test('AI Agent keeps thought text hidden when Include Thoughts is disabled', asy
     global.fetch = originalFetch;
   }
 });
+
+test('UniversalChatModel node declares serviceTier in geminiOptions with standard, flex, and priority', () => {
+  const node = new UniversalChatModel();
+  const geminiOptionsProp = node.description.properties.find(
+    (prop) => prop.name === 'geminiOptions',
+  );
+  assert.ok(geminiOptionsProp, 'geminiOptions property must exist');
+  const serviceTierOption = geminiOptionsProp.options.find(
+    (opt) => opt.name === 'serviceTier',
+  );
+  assert.ok(serviceTierOption, 'serviceTier option must exist in geminiOptions');
+  assert.equal(serviceTierOption.type, 'options');
+  assert.equal(serviceTierOption.default, 'standard');
+  const values = serviceTierOption.options.map((item) => item.value);
+  assert.deepEqual(values, ['standard', 'flex', 'priority']);
+});
+
+test('UniversalChatModel supplyData passes configured serviceTier to GeminiChatModel and invocationParams', async () => {
+  const parameters = {
+    provider: 'gemini',
+    geminiModel: 'gemini-3.5-flash-lite',
+    geminiOptions: {
+      serviceTier: 'flex',
+    },
+  };
+  const context = {
+    getNodeParameter(name, _itemIndex, fallback) {
+      return parameters[name] ?? fallback;
+    },
+    async getCredentials() {
+      return { apiKey: 'test' };
+    },
+    getNode() {
+      return { parameters };
+    },
+    logAiEvent() {},
+  };
+
+  const supplied = await new UniversalChatModel().supplyData.call(context, 0);
+  const params = supplied.response.invocationParams({});
+  assert.equal(params.service_tier, 'flex');
+  assert.equal(params.serviceTier, undefined);
+  assert.equal(params.generationConfig?.service_tier, undefined);
+  assert.equal(params.generationConfig?.serviceTier, undefined);
+});
+
+test('GeminiChatModel sends service_tier in request payload and captures it in response metadata', async () => {
+  const originalFetch = global.fetch;
+  let requestBody;
+  global.fetch = async (request, init) => {
+    requestBody = await readFetchJson(request, init);
+    return new Response(
+      JSON.stringify({
+        candidates: [
+          {
+            content: {
+              role: 'model',
+              parts: [{ text: 'Flex response text' }],
+            },
+            finishReason: 'STOP',
+            index: 0,
+          },
+        ],
+        usageMetadata: {
+          promptTokenCount: 10,
+          candidatesTokenCount: 15,
+          totalTokenCount: 25,
+        },
+        modelVersion: 'gemini-3.5-flash-lite',
+        responseId: 'resp-service-tier-test',
+      }),
+      {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-gemini-service-tier': 'flex',
+        },
+      },
+    );
+  };
+
+  try {
+    const model = new GeminiChatModel({
+      apiKey: 'test',
+      model: 'gemini-3.5-flash-lite',
+      serviceTier: 'flex',
+    });
+
+    const response = await model.invoke('Teste de service tier');
+    assert.equal(response.text, 'Flex response text');
+    assert.ok(requestBody, 'Request body should have been captured');
+    assert.equal(requestBody.service_tier, 'flex');
+    assert.equal(requestBody.serviceTier, undefined);
+    assert.equal(requestBody.generationConfig?.service_tier, undefined);
+    assert.equal(requestBody.generationConfig?.serviceTier, undefined);
+    assert.equal(response.response_metadata.gemini.serviceTier, 'flex');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('GeminiChatModel streaming sends service_tier in root request payload without generationConfig contamination', async () => {
+  const originalFetch = global.fetch;
+  let requestBody;
+  global.fetch = async (request, init) => {
+    requestBody = await readFetchJson(request, init);
+    const sseChunk =
+      'data: ' +
+      JSON.stringify({
+        candidates: [
+          {
+            content: {
+              role: 'model',
+              parts: [{ text: 'Streamed flex chunk' }],
+            },
+            finishReason: 'STOP',
+            index: 0,
+          },
+        ],
+        usageMetadata: {
+          promptTokenCount: 8,
+          candidatesTokenCount: 12,
+          totalTokenCount: 20,
+        },
+        modelVersion: 'gemini-3.8-flash',
+        responseId: 'resp-stream-tier-test',
+      }) +
+      '\n\n';
+
+    return new Response(sseChunk, {
+      status: 200,
+      headers: {
+        'content-type': 'text/event-stream',
+      },
+    });
+  };
+
+  try {
+    const model = new GeminiChatModel({
+      apiKey: 'test',
+      model: 'gemini-3.8-flash',
+      serviceTier: 'flex',
+    });
+
+    const stream = await model.stream('Teste stream flex');
+    const chunks = [];
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+
+    assert.ok(chunks.length > 0, 'Stream should yield chunks');
+    assert.equal(chunks[0].text, 'Streamed flex chunk');
+    assert.ok(requestBody, 'Request body should have been captured');
+    assert.equal(requestBody.service_tier, 'flex');
+    assert.equal(requestBody.serviceTier, undefined);
+    assert.equal(requestBody.generationConfig?.service_tier, undefined);
+    assert.equal(requestBody.generationConfig?.serviceTier, undefined);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+

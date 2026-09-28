@@ -14,6 +14,7 @@ export interface AgentModelCallMetadata {
   includeIntermediateStepsInOutput?: boolean;
   usageMetadata?: IDataObject;
   gemini?: IDataObject;
+  geminiRequests?: IDataObject[];
   structuredOutput?: IDataObject;
 }
 
@@ -25,11 +26,16 @@ const agentCapture = new AsyncLocalStorage<AgentCaptureStore>();
 const patchedAgentSymbol = Symbol.for(
   'n8n-nodes-universal-chatmodel.agent-output-bridge',
 );
+const patchedExecutorSymbol = Symbol.for(
+  'n8n-nodes-universal-chatmodel.agent-executor-output-bridge',
+);
 const moduleLoadHookSymbol = Symbol.for(
   'n8n-nodes-universal-chatmodel.agent-module-load-hook',
 );
 const agentModulePattern =
   /[\\/]n8n-nodes-langchain[\\/].*[\\/]nodes[\\/]agents[\\/]Agent[\\/]V[123][\\/]AgentV[123]\.node\.(?:js|cjs)$/i;
+const agentExecutorModulePattern =
+  /[\\/]n8n-nodes-langchain[\\/].*[\\/]nodes[\\/]agents[\\/]Agent[\\/]agents[\\/].*[\\/]execute\.(?:js|cjs)$/i;
 
 const tokenUsageNumberFields = [
   'inputTokens',
@@ -151,6 +157,15 @@ function buildAgentOutputMetadata(
   );
   const lastCallWithVisibleUsage =
     callsWithVisibleUsage[callsWithVisibleUsage.length - 1];
+  const geminiRequests = calls.flatMap((call, callIndex) =>
+    call.includeTokenUsageInAgentOutput === true && Array.isArray(call.geminiRequests)
+      ? call.geminiRequests.map((request, requestIndex) => ({
+          call: callIndex + 1,
+          requestNumber: requestIndex + 1,
+          ...cloneValue(request),
+        }))
+      : [],
+  );
 
   // Capturing metadata is always enabled internally so Usage Reporter and
   // tracing remain complete. Public Agent output, however, must stay clean
@@ -189,6 +204,9 @@ function buildAgentOutputMetadata(
       : {}),
     ...(exposeUsage && lastCall.gemini
       ? { gemini: cloneValue(lastCall.gemini) }
+      : {}),
+    ...(geminiRequests.length > 0
+      ? { geminiRequests: cloneValue(geminiRequests) as any[] }
       : {}),
     ...(exposeUsage
       ? {
@@ -263,6 +281,24 @@ function attachMetadataToAgentResult(
   return result;
 }
 
+async function captureAgentExecution(
+  originalExecute: (...args: unknown[]) => Promise<unknown>,
+  receiver: unknown,
+  args: unknown[],
+): Promise<unknown> {
+  const existingStore = agentCapture.getStore();
+  if (existingStore) {
+    const nestedResult = await originalExecute.apply(receiver, args);
+    return attachMetadataToAgentResult(nestedResult, existingStore.calls);
+  }
+
+  const store: AgentCaptureStore = { calls: readPreviousCalls(args) };
+  return agentCapture.run(store, async () => {
+    const result = await originalExecute.apply(receiver, args);
+    return attachMetadataToAgentResult(result, store.calls);
+  });
+}
+
 function patchAgentClass(agentClass: unknown): boolean {
   if (typeof agentClass !== 'function') return false;
 
@@ -276,21 +312,8 @@ function patchAgentClass(agentClass: unknown): boolean {
   }
 
   const originalExecute = prototype.execute;
-  prototype.execute = async function (...args: unknown[]) {
-    const existingStore = agentCapture.getStore();
-    if (existingStore) {
-      const nestedResult = await originalExecute.apply(this, args);
-      return attachMetadataToAgentResult(nestedResult, existingStore.calls);
-    }
-
-    const store: AgentCaptureStore = {
-      calls: readPreviousCalls(args),
-    };
-
-    return agentCapture.run(store, async () => {
-      const result = await originalExecute.apply(this, args);
-      return attachMetadataToAgentResult(result, store.calls);
-    });
+  prototype.execute = function (...args: unknown[]) {
+    return captureAgentExecution(originalExecute, this, args);
   };
 
   Object.defineProperty(prototype, patchedAgentSymbol, {
@@ -304,14 +327,37 @@ function patchAgentClass(agentClass: unknown): boolean {
 }
 
 function patchAgentModule(filename: string, moduleExports: unknown): number {
-  if (!agentModulePattern.test(filename)) return 0;
-
   const exportsRecord = asRecord(moduleExports);
   if (!exportsRecord) return 0;
 
   let patched = 0;
-  for (const exportName of ['AgentV1', 'AgentV2', 'AgentV3']) {
-    if (patchAgentClass(exportsRecord[exportName])) patched += 1;
+  if (agentModulePattern.test(filename)) {
+    for (const exportName of ['AgentV1', 'AgentV2', 'AgentV3']) {
+      if (patchAgentClass(exportsRecord[exportName])) patched += 1;
+    }
+  }
+
+  // Versioned Agent methods delegate to exported executor functions. This
+  // also catches executions when n8n retained the original class method.
+  if (agentExecutorModulePattern.test(filename)) {
+    for (const [name, original] of Object.entries(exportsRecord)) {
+      if (
+        !/AgentExecute$/.test(name) ||
+        typeof original !== 'function' ||
+        (original as any)[patchedExecutorSymbol] === true
+      ) continue;
+
+      const wrapped = function (this: unknown, ...args: unknown[]) {
+        return captureAgentExecution(original as (...args: unknown[]) => Promise<unknown>, this, args);
+      };
+      Object.defineProperty(wrapped, patchedExecutorSymbol, { value: true });
+      try {
+        exportsRecord[name] = wrapped;
+        patched += 1;
+      } catch {
+        // A read-only module namespace still has the class-level bridge.
+      }
+    }
   }
 
   return patched;

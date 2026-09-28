@@ -1158,6 +1158,14 @@ export class UniversalChatModel implements INodeType {
             description: 'Return available thought summaries in model and consumer metadata. Gemini may take longer to generate these summaries. Thoughts remain hidden unless this option is enabled.',
           },
           {
+            displayName: 'Include Gemini Request Details in Output',
+            name: 'includeRequestDetailsInOutput',
+            type: 'boolean',
+            default: false,
+            description:
+              'Include the full Gemini request and response for each API call in geminiRequests, alongside the provider token counts. This can include system prompts, chat history, tool schemas and tool results. Gemini does not report exact token counts per field.',
+          },
+          {
             displayName: 'Model Request Timeout',
             name: 'requestTimeoutMs',
             type: 'number',
@@ -1175,6 +1183,30 @@ export class UniversalChatModel implements INodeType {
             type: 'boolean',
             default: true,
             description: 'Automatically makes one safe continuation request when Gemini returns STOP with no text and no function call. Valid tool calls are never retried.',
+          },
+          {
+            displayName: 'Service Tier',
+            name: 'serviceTier',
+            type: 'options',
+            options: [
+              {
+                name: 'Standard (Default)',
+                value: 'standard',
+                description: 'Sequential content generation with standard pricing and normal latency',
+              },
+              {
+                name: 'Flex (Cost-Optimized - 50% Discount)',
+                value: 'flex',
+                description: '50% discount using off-peak capacity. Recommended to increase Request Timeout if wait queues are long',
+              },
+              {
+                name: 'Priority (Latency-Optimized)',
+                value: 'priority',
+                description: 'Highest reliability and lowest latency with non-sheddable compute queues (75-100% premium)',
+              },
+            ],
+            default: 'standard',
+            description: 'Inference service tier for balancing cost, latency, and reliability per Gemini API optimization guidelines.',
           },
           {
             displayName: 'Safety Settings',
@@ -1450,9 +1482,11 @@ export class UniversalChatModel implements INodeType {
         thinkingLevel?: string;
         thinkingBudget?: number;
         includeThoughts?: boolean;
+        includeRequestDetailsInOutput?: boolean;
         requestTimeoutMs?: number;
         recoverEmptyResponses?: boolean;
         safetySettings?: { values?: Array<{ category: string; threshold: string }> };
+        serviceTier?: string;
       };
 
       // Preserve values from workflows created with the pre-collection UI.
@@ -1469,6 +1503,7 @@ export class UniversalChatModel implements INodeType {
       opts.responseMimeType = useLegacy(opts.responseMimeType, 'geminiResponseMimeType');
       opts.includeThoughts = useLegacy(opts.includeThoughts, 'includeThoughts');
       opts.safetySettings = useLegacy(opts.safetySettings, 'geminiSafetySettings');
+      opts.serviceTier = useLegacy(opts.serviceTier, 'geminiServiceTier');
       const sharedOptions = resolveSharedModelOptions(this, opts);
 
       const legacyThinkingMode = legacy.thinkingMode;
@@ -1548,6 +1583,7 @@ export class UniversalChatModel implements INodeType {
         maxRetries: 0,
         recoverEmptyResponses: opts.recoverEmptyResponses !== false,
         requestTimeoutMs: opts.requestTimeoutMs ?? 60_000,
+        includeRequestDetailsInOutput: opts.includeRequestDetailsInOutput === true,
       };
       const usageReporter = await createUsageReporter(
         this,
@@ -1560,7 +1596,8 @@ export class UniversalChatModel implements INodeType {
           this,
           'gemini',
           shouldIncludeThoughts,
-          sharedOptions.includeTokenUsageInAgentOutput === true,
+          sharedOptions.includeTokenUsageInAgentOutput === true ||
+            opts.includeRequestDetailsInOutput === true,
           sharedOptions.includeIntermediateStepsInOutput === true,
           usageReporter,
           sharedOptions.failOnReporterError === true,
@@ -1576,6 +1613,9 @@ export class UniversalChatModel implements INodeType {
       if (responseSchema !== undefined) modelInput.responseSchema = responseSchema;
       if (Object.keys(thinkingConfig).length > 0) modelInput.thinkingConfig = thinkingConfig;
       if (safetySettings.length > 0) modelInput.safetySettings = safetySettings;
+      if (typeof opts.serviceTier === 'string' && opts.serviceTier.trim().length > 0) {
+        modelInput.serviceTier = opts.serviceTier.trim();
+      }
 
       let model: BaseChatModel = new GeminiChatModel(modelInput, (usage) => {
         this.logAiEvent('ai-tokens-usage' as any, formatGeminiUsage(usage));
