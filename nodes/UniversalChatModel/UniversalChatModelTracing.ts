@@ -9,7 +9,7 @@ import {
 } from 'n8n-workflow';
 
 import type { GeminiRequestDetail, GeminiResponseMetadata, GeminiUsageMetadata } from './GeminiChatModel';
-import { augmentAnthropicMessage } from './AnthropicChatModel';
+import { augmentAnthropicMessage } from './AnthropicMessageAugmenter';
 import { recordAgentModelMetadata } from './AgentOutputBridge';
 import {
   type ModelProvider,

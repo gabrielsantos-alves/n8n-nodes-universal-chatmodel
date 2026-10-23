@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.41 - 2026-10-23
+
+- Corrige falha de carregamento e atualização do pacote no n8n (`The specified package could not be loaded` / `Cannot find module '.../@langchain/core/node_modules/zod/v4/core/index.cjs'`) em ambientes de produção:
+  - Implementa Lazy Loading completo de `@langchain/core`, `UniversalChatModelTracing` e dos adaptadores de modelo (`GeminiChatModel`, `AnthropicChatModel`, `ChatOpenAI`), eliminando qualquer importação de `@langchain/*` ou `zod` no top-level durante a validação de instalação/atualização do pacote pelo n8n.
+  - Adiciona fallback de resolução em `Module._resolveFilename` e symlinks de segurança em `AgentOutputBridge.ts` para contornar o cache em memória de `package.json` do Node.js quando o `npm` deduplica subdependências (como `zod`) durante um hot-update sem reinício do container.
+  - Isola a função pura `augmentAnthropicMessage` e `parsePayload` em `AnthropicMessageAugmenter.ts`.
+  - Fixa `@anthropic-ai/sdk` (`^0.115.0`) diretamente em `dependencies` para evitar resolução de SDKs legados no diretório compartilhado do n8n.
+  - Garante persistência do singleton de captura de telemetria do AI Agent em `globalThis` (`Symbol.for`), tornando o `AsyncLocalStorage` imune a hot-reloads.
+
 ## 1.0.39 - 2026-10-22
 
 - Adiciona suporte nativo a **Server-Side Tools** no provedor Anthropic Claude:

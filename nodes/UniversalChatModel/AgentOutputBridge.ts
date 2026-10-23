@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { existsSync, mkdirSync, symlinkSync } from 'node:fs';
 import Module from 'node:module';
+import { join, resolve } from 'node:path';
 
 import type { IDataObject } from 'n8n-workflow';
 import {
@@ -25,7 +27,13 @@ interface AgentCaptureStore {
   calls: AgentModelCallMetadata[];
 }
 
-const agentCapture = new AsyncLocalStorage<AgentCaptureStore>();
+const agentCaptureKey = Symbol.for(
+  'n8n-nodes-universal-chatmodel.agent-capture-store',
+);
+const agentCapture: AsyncLocalStorage<AgentCaptureStore> =
+  (globalThis as any)[agentCaptureKey] ??
+  ((globalThis as any)[agentCaptureKey] =
+    new AsyncLocalStorage<AgentCaptureStore>());
 const patchedAgentSymbol = Symbol.for(
   'n8n-nodes-universal-chatmodel.agent-output-bridge',
 );
@@ -480,6 +488,128 @@ function patchLoadedAgentClasses(): number {
 }
 
 let patchChecksScheduled = false;
+const resolveFallbackSymbol = Symbol.for(
+  'n8n-nodes-universal-chatmodel.resolve-fallback-hook',
+);
+
+function extractPackageName(request: string): string | undefined {
+  if (
+    !request ||
+    request.startsWith('.') ||
+    request.startsWith('/') ||
+    request.startsWith('node:') ||
+    /^[a-zA-Z]:[\\/]/.test(request)
+  ) {
+    return undefined;
+  }
+  const parts = request.split('/');
+  if (request.startsWith('@')) {
+    return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : undefined;
+  }
+  return parts[0];
+}
+
+function getPackageRootDir(): string {
+  const distCandidate = resolve(__dirname, '..', '..', '..');
+  if (existsSync(join(distCandidate, 'package.json'))) {
+    return distCandidate;
+  }
+  return resolve(__dirname, '..', '..');
+}
+
+function ensureNestedNodeModulesFallbacks(): void {
+  try {
+    const pkgRoot = getPackageRootDir();
+    const localNodeModules = join(pkgRoot, 'node_modules');
+    const sharedNodeModules = resolve(pkgRoot, '..');
+    const zodSource = existsSync(join(localNodeModules, 'zod', 'package.json'))
+      ? join(localNodeModules, 'zod')
+      : existsSync(join(sharedNodeModules, 'zod', 'package.json'))
+        ? join(sharedNodeModules, 'zod')
+        : undefined;
+
+    if (!zodSource) return;
+
+    for (const subPkg of ['core', 'anthropic', 'openai', 'google-genai']) {
+      const langchainSubDir = join(localNodeModules, '@langchain', subPkg);
+      if (!existsSync(langchainSubDir)) continue;
+      const nestedZodDir = join(langchainSubDir, 'node_modules', 'zod');
+      if (existsSync(join(nestedZodDir, 'package.json'))) continue;
+      try {
+        mkdirSync(join(langchainSubDir, 'node_modules'), { recursive: true });
+        symlinkSync(zodSource, nestedZodDir, 'junction');
+      } catch {
+        // Ignore read-only filesystem or permission errors; _resolveFilename hook still covers it
+      }
+    }
+  } catch {
+    // Best-effort filesystem link
+  }
+}
+
+function installStalePackageCacheFallback(): void {
+  const moduleApi = Module as any;
+  if (moduleApi[resolveFallbackSymbol] === true) return;
+
+  const originalResolveFilename = moduleApi._resolveFilename;
+  moduleApi._resolveFilename = function (
+    request: string,
+    parent: NodeModule | undefined,
+    isMain: boolean,
+    options?: any,
+  ) {
+    try {
+      return originalResolveFilename.apply(this, arguments);
+    } catch (err: any) {
+      const pkgName =
+        typeof request === 'string' ? extractPackageName(request) : undefined;
+      if (pkgName && parent && Array.isArray(parent.paths)) {
+        const pathCache = moduleApi._pathCache;
+        if (pathCache && typeof pathCache === 'object') {
+          for (const key of Object.keys(pathCache)) {
+            if (key.includes(pkgName)) delete pathCache[key];
+          }
+        }
+
+        const localNm = join(getPackageRootDir(), 'node_modules');
+        const candidatePaths = [
+          localNm,
+          ...parent.paths.filter((p: string) => p !== localNm),
+        ];
+        const validPaths = candidatePaths.filter((p: string) =>
+          existsSync(join(p, pkgName, 'package.json')),
+        );
+
+        for (const validPath of validPaths) {
+          try {
+            const singlePathParent = Object.assign(
+              Object.create(Object.getPrototypeOf(parent)),
+              parent,
+              { paths: [validPath] },
+            );
+            return originalResolveFilename.call(
+              this,
+              request,
+              singlePathParent,
+              isMain,
+              options,
+            );
+          } catch {
+            // Try next valid node_modules path that actually contains the required subpath
+          }
+        }
+      }
+      throw err;
+    }
+  };
+
+  Object.defineProperty(moduleApi, resolveFallbackSymbol, {
+    value: true,
+    configurable: false,
+    enumerable: false,
+    writable: false,
+  });
+}
 
 function installAgentModuleLoadHook(): void {
   const moduleApi = Module as any;
@@ -513,6 +643,8 @@ function installAgentModuleLoadHook(): void {
 }
 
 export function installAgentOutputBridge(): number {
+  ensureNestedNodeModulesFallbacks();
+  installStalePackageCacheFallback();
   installAgentModuleLoadHook();
   const patched = patchLoadedAgentClasses();
 

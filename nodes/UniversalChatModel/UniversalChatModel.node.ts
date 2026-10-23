@@ -12,20 +12,21 @@ import {
 } from 'n8n-workflow';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, parse } from 'node:path';
-import { AnthropicChatModel } from './AnthropicChatModel';
-import { ChatOpenAI } from '@langchain/openai';
+import './AgentOutputBridge';
+import type { AnthropicChatModel as AnthropicChatModelType } from './AnthropicChatModel';
+import type { ChatOpenAI as ChatOpenAIType } from '@langchain/openai';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
-import {
-  AIMessage,
-  AIMessageChunk,
-  SystemMessage,
-  type BaseMessage,
+import type {
+  AIMessage as AIMessageType,
+  AIMessageChunk as AIMessageChunkType,
+  SystemMessage as SystemMessageType,
+  BaseMessage,
 } from '@langchain/core/messages';
-import { ChatGenerationChunk } from '@langchain/core/outputs';
-import { GeminiChatModel, formatGeminiUsage } from './GeminiChatModel';
-import {
-  type ModelUsageReporter,
-  UniversalChatModelTracing,
+import type { ChatGenerationChunk as ChatGenerationChunkType } from '@langchain/core/outputs';
+import type { GeminiChatModel as GeminiChatModelType } from './GeminiChatModel';
+import type {
+  ModelUsageReporter,
+  UniversalChatModelTracing as UniversalChatModelTracingType,
 } from './UniversalChatModelTracing';
 import {
   type ModelProvider,
@@ -678,10 +679,25 @@ function errorDetails(
   return normalizeModelError(error, provider);
 }
 
+function getLangChainMessages(): {
+  AIMessage: typeof AIMessageType;
+  AIMessageChunk: typeof AIMessageChunkType;
+  SystemMessage: typeof SystemMessageType;
+} {
+  return require('@langchain/core/messages');
+}
+
+function getLangChainOutputs(): {
+  ChatGenerationChunk: typeof ChatGenerationChunkType;
+} {
+  return require('@langchain/core/outputs');
+}
+
 function continuedErrorMessage(
   error: unknown,
   provider: ModelProvider,
-): AIMessage {
+): AIMessageType {
+  const { AIMessage } = getLangChainMessages();
   const normalizedError = toUniversalModelError(error, provider);
   const details = errorDetails(normalizedError, provider);
   return new AIMessage({
@@ -745,6 +761,7 @@ export function applyModelRetry(
       settings.alwaysOutputData &&
       (!Array.isArray(result?.generations) || result.generations.length === 0)
     ) {
+      const { AIMessage } = getLangChainMessages();
       result.generations = [
         {
           text: '',
@@ -772,6 +789,8 @@ export function applyModelRetry(
             yield chunk;
           }
           if (settings.alwaysOutputData && !emittedAnyChunk) {
+            const { AIMessageChunk } = getLangChainMessages();
+            const { ChatGenerationChunk } = getLangChainOutputs();
             yield new ChatGenerationChunk({
               text: '',
               message: new AIMessageChunk(''),
@@ -805,6 +824,8 @@ export function applyModelRetry(
           }
 
           if (settings.onError === 'continueRegularOutput') {
+            const { AIMessageChunk } = getLangChainMessages();
+            const { ChatGenerationChunk } = getLangChainOutputs();
             const details = errorDetails(normalizedError, provider);
             details.attempts = attempt;
             yield new ChatGenerationChunk({
@@ -846,6 +867,7 @@ export function applySystemMessage(
   if (!content) return model;
 
   const inject = (messages: BaseMessage[]): BaseMessage[] => {
+    const { SystemMessage } = getLangChainMessages();
     const next = [...messages];
     let systemCount = 0;
     while (
@@ -1707,6 +1729,9 @@ export class UniversalChatModel implements INodeType {
   };
 
   async supplyData(this: ISupplyDataFunctions, itemIndex: number): Promise<SupplyData> {
+    const { UniversalChatModelTracing } = require('./UniversalChatModelTracing') as {
+      UniversalChatModelTracing: typeof UniversalChatModelTracingType;
+    };
     const executionSettings = getModelExecutionSettings(this, itemIndex);
     const executionItemIndex = executionSettings.executeOnce ? 0 : itemIndex;
     const provider = this.getNodeParameter('provider', executionItemIndex) as string;
@@ -1880,6 +1905,10 @@ export class UniversalChatModel implements INodeType {
         modelInput.serviceTier = opts.serviceTier.trim();
       }
 
+      const { GeminiChatModel, formatGeminiUsage } = require('./GeminiChatModel') as {
+        GeminiChatModel: typeof GeminiChatModelType;
+        formatGeminiUsage: (usage: any) => any;
+      };
       let model: BaseChatModel = new GeminiChatModel(modelInput, (usage) => {
         this.logAiEvent('ai-tokens-usage' as any, formatGeminiUsage(usage));
       }) as BaseChatModel;
@@ -2017,6 +2046,9 @@ export class UniversalChatModel implements INodeType {
             }
           : undefined;
 
+      const { AnthropicChatModel } = require('./AnthropicChatModel') as {
+        AnthropicChatModel: typeof AnthropicChatModelType;
+      };
       let model: BaseChatModel = new AnthropicChatModel(modelOptions, serverToolsOptions);
       model = applySystemMessage(model, sharedOptions.systemMessage ?? '');
 
@@ -2124,6 +2156,9 @@ export class UniversalChatModel implements INodeType {
         modelOptions.reasoningEffort = reasoningEffort;
       }
 
+      const { ChatOpenAI } = require('@langchain/openai') as {
+        ChatOpenAI: typeof ChatOpenAIType;
+      };
       let model: BaseChatModel = new ChatOpenAI(modelOptions);
       model = applySystemMessage(model, sharedOptions.systemMessage ?? '');
 

@@ -1,13 +1,22 @@
-# Task State: Server-Side Tool Details in Agent Output (Option 1)
+# TASK_STATE: Fix n8n Node Loading & Module Collisions
 
 ## Objetivo
-Expor detalhes estruturados de pesquisas na web (queries, fontes e citações) e execução de código Python (script e resultado) diretamente no JSON de saída do AI Agent (`grounding` e `codeExecutions`).
+Resolver o erro de carregamento e atualização do pacote no n8n de produção (`Error updating package "n8n-nodes-universal-chatmodel": The specified package could not be loaded` / `Cannot find module '.../@langchain/core/node_modules/zod/v4/core/index.cjs'`).
 
-## Status do Progresso
-- [x] Passo 1: Atualizar `GeminiChatModel.ts` para capturar `groundingMetadata` e `codeExecution` dos candidatos e parts.
-- [x] Passo 2: Atualizar `AnthropicChatModel.ts` para capturar tool uses e resultados de `web_search`, `web_fetch` e `code_execution`.
-- [x] Passo 3: Atualizar `UniversalChatModelTracing.ts` para extrair e encaminhar `grounding` e `codeExecutions`.
-- [x] Passo 4: Atualizar `AgentOutputBridge.ts` para mesclar e anexar `grounding` e `codeExecutions` no JSON final do AI Agent.
-- [x] Passo 5: Atualizar `UniversalChatModel.node.ts` adicionando `includeServerToolDetailsInOutput` em `sharedModelOptions` e passando para o tracing.
-- [x] Passo 6: Atualizar testes em `tests/universal-chat-model.test.cjs` cobrindo extração, mesclagem e bridge.
-- [x] Passo 7: Validação final única com `npm test` e `npm run verify:package`.
+## Causa Raiz Confirmada pela Stack Trace
+1. Na v1.0.37 em produção, `zod@4.x` estava aninhado em `node_modules/@langchain/core/node_modules/zod` (porque na raiz do n8n havia `zod@3.25.67` do `token-guard`). O CJS Loader do Node.js memorizou esse `package.json` no cache interno em memória (`packageJsonCache`).
+2. Na atualização para v1.0.39 (que adicionou `@langchain/anthropic`), o `npm` deduplicou `zod@4.x` movendo-o de `node_modules/@langchain/core/node_modules/zod` para `node_modules/zod`.
+3. Sem reiniciar o container do n8n, ao carregar `UniversalChatModel.node.js`, os imports top-level de `@langchain/core/messages` disparavam `require('zod/v4/core')`. O `resolveExports` do Node.js lia o `package.json` obsoleto do cache da RAM e tentava acessar `.../@langchain/core/node_modules/zod/v4/core/index.cjs` (que não existia mais no disco), lançando `MODULE_NOT_FOUND` sem continuar a busca em `parent.paths`.
+
+## Passos Concluídos
+- [x] 1. Isolar `augmentAnthropicMessage` e `parsePayload` em `nodes/UniversalChatModel/AnthropicMessageAugmenter.ts`.
+- [x] 2. Reexportar `augmentAnthropicMessage` em `nodes/UniversalChatModel/AnthropicChatModel.ts`.
+- [x] 3. Atualizar `nodes/UniversalChatModel/UniversalChatModelTracing.ts` para importar de `AnthropicMessageAugmenter`.
+- [x] 4. Implementar Lazy Loading completo em `nodes/UniversalChatModel/UniversalChatModel.node.ts` (zero imports de `@langchain/*` no top-level durante a validação de instalação/atualização do n8n).
+- [x] 5. Implementar `installStalePackageCacheFallback` (`Module._resolveFilename`) e `ensureNestedNodeModulesFallbacks` (symlinks) em `nodes/UniversalChatModel/AgentOutputBridge.ts` para contornar o cache de `package.json` do Node.js após hot-updates do `npm`.
+- [x] 6. Fixar `@anthropic-ai/sdk: ^0.115.0` e incrementar versão para `1.0.41` em `package.json`.
+- [x] 7. Adicionar teste reproduzindo o bug do `packageJsonCache` do Node.js durante hot-update em `tests/universal-chat-model.test.cjs` e atualizar `CHANGELOG.md`.
+- [x] 8. Validar suíte completa (`npm test`: 108/108 testes passando).
+
+## Estado Atual
+Pronto para publicação da versão `1.0.41`.

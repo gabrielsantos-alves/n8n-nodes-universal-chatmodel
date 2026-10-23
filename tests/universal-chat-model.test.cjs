@@ -110,10 +110,64 @@ test('package targets the runtime dependency set used by n8n 2.32.6', () => {
     'npm:@langchain/core@1.2.0',
   );
   assert.equal(packageJson.dependencies['@langchain/core'], '1.2.4');
+  assert.equal(packageJson.dependencies['@anthropic-ai/sdk'], '^0.115.0');
   assert.equal(packageJson.dependencies['@langchain/anthropic'], '1.5.3');
   assert.equal(packageJson.dependencies['@google/generative-ai'], '0.24.0');
   assert.equal(packageJson.dependencies['@langchain/google-genai'], '2.1.24');
   assert.equal(packageJson.dependencies['@langchain/openai'], '1.5.5');
+});
+
+test('AnthropicMessageAugmenter is isolated and pure without importing langchain anthropic directly', () => {
+  const { augmentAnthropicMessage: pureAugment } = require('../dist/nodes/UniversalChatModel/AnthropicMessageAugmenter.js');
+  const message = {
+    content: [
+      {
+        type: 'tool_use',
+        name: 'web_search',
+        input: { query: 'n8n community nodes' },
+      },
+    ],
+  };
+  pureAugment(message);
+  assert.deepEqual(message.response_metadata?.grounding?.queries, ['n8n community nodes']);
+});
+
+test('AgentOutputBridge module resolution fallback recovers when npm deduplicates nested zod during hot update', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const Module = require('node:module');
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ucm-hot-update-'));
+  try {
+    const nestedPkgDir = path.join(tmp, 'node_modules', '@langchain', 'core', 'node_modules', 'fake-zod');
+    const hoistedPkgDir = path.join(tmp, 'node_modules', 'fake-zod');
+    fs.mkdirSync(path.join(nestedPkgDir, 'v4', 'core'), { recursive: true });
+    fs.writeFileSync(
+      path.join(nestedPkgDir, 'package.json'),
+      JSON.stringify({ name: 'fake-zod', exports: { './v4/core': './v4/core/index.cjs' } }),
+    );
+    fs.writeFileSync(path.join(nestedPkgDir, 'v4', 'core', 'index.cjs'), 'module.exports = { ok: true };');
+
+    const parentMod = {
+      filename: path.join(tmp, 'node_modules', '@langchain', 'core', 'index.js'),
+      paths: [
+        path.join(tmp, 'node_modules', '@langchain', 'core', 'node_modules'),
+        path.join(tmp, 'node_modules'),
+      ],
+    };
+
+    const firstResolved = Module._resolveFilename('fake-zod/v4/core', parentMod);
+    assert.equal(firstResolved, path.join(nestedPkgDir, 'v4', 'core', 'index.cjs'));
+
+    // Simulate npm hot-update moving fake-zod from nested @langchain/core/node_modules to top-level node_modules
+    fs.renameSync(nestedPkgDir, hoistedPkgDir);
+
+    const secondResolved = Module._resolveFilename('fake-zod/v4/core', parentMod);
+    assert.equal(secondResolved, path.join(hoistedPkgDir, 'v4', 'core', 'index.cjs'));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 test('Gemini generation controls are optional collection entries', () => {
