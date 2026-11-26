@@ -926,6 +926,38 @@ function detailsForFinalError(
 }
 
 /**
+ * Keeps the user's currently selected model in dynamic dropdown options when
+ * switching credentials so n8n's ParameterInput watcher does not reset the
+ * field to its default value if the new credential returns a different list or
+ * temporarily fails to fetch models.
+ */
+function preserveCurrentModelOption(
+  context: ILoadOptionsFunctions,
+  parameterName: string,
+  options: INodePropertyOptions[],
+): INodePropertyOptions[] {
+  try {
+    const raw =
+      typeof context.getCurrentNodeParameter === 'function'
+        ? context.getCurrentNodeParameter(parameterName)
+        : undefined;
+    const currentValue = typeof raw === 'string' ? raw.trim() : '';
+    if (
+      currentValue &&
+      !options.some((option) => option.value === currentValue)
+    ) {
+      return [
+        { name: `${currentValue} (Current)`, value: currentValue },
+        ...options,
+      ];
+    }
+  } catch {
+    // Ignore when loadOptions runs without an active parameter snapshot.
+  }
+  return options;
+}
+
+/**
  * Wraps a LangChain model to intercept responses and log token usage metadata.
  * This creates a proxy that captures usage_metadata from AIMessage responses.
  */
@@ -963,11 +995,24 @@ export class UniversalChatModel implements INodeType {
         },
       },
       {
+        // Use a condition object instead of a plain string value on the optional
+        // OpenAI-compatible credential so n8n's getMainAuthField() does not classify
+        // `provider` as the main auth field, while keeping identical visibility for
+        // saved workflows (including legacy nodes where `provider` is omitted).
+        // Otherwise n8n's NodeCredentials.vue re-emits `parameters.provider` on every
+        // credential change, hitting n8n 2.32.x's removeMismatchedOptionValues() bug
+        // and wiping collection options (geminiOptions/anthropicOptions/openaiOptions).
         name: 'openAiCompatibleApi',
         required: false,
         displayOptions: {
           show: {
-            provider: ['openai_compatible'],
+            provider: [
+              {
+                _cnd: {
+                  eq: 'openai_compatible',
+                },
+              } as unknown as string,
+            ],
           },
         },
       },
@@ -1600,7 +1645,9 @@ export class UniversalChatModel implements INodeType {
           { name: 'Gemini 2.5 Flash', value: 'gemini-2.5-flash' },
         ];
 
-        if (!apiKey) return defaultModels;
+        if (!apiKey) {
+          return preserveCurrentModelOption(this, 'geminiModel', defaultModels);
+        }
 
         try {
           const response = await this.helpers.httpRequest({
@@ -1622,11 +1669,13 @@ export class UniversalChatModel implements INodeType {
                 }
               }
             }
-            if (options.length > 0) return options;
+            if (options.length > 0) {
+              return preserveCurrentModelOption(this, 'geminiModel', options);
+            }
           }
         } catch { /* fallback */ }
 
-        return defaultModels;
+        return preserveCurrentModelOption(this, 'geminiModel', defaultModels);
       },
 
       async getAnthropicModels(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
@@ -1651,7 +1700,9 @@ export class UniversalChatModel implements INodeType {
           { name: 'Claude 3.5 Sonnet (Legacy)', value: 'claude-3-5-sonnet-20241022' },
         ];
 
-        if (!apiKey) return defaultModels;
+        if (!apiKey) {
+          return preserveCurrentModelOption(this, 'anthropicModel', defaultModels);
+        }
 
         try {
           const modelsUrl = baseUrl.endsWith('/v1') ? `${baseUrl}/models` : `${baseUrl}/v1/models`;
@@ -1666,15 +1717,16 @@ export class UniversalChatModel implements INodeType {
           });
 
           if (response && Array.isArray(response.data) && response.data.length > 0) {
-            return response.data.map((m: any) => {
+            const options = response.data.map((m: any) => {
               const modelId = String(m.id || m.name || m);
               const label = m.display_name ? `${m.display_name} (${modelId})` : modelId;
               return { name: label, value: modelId };
             });
+            return preserveCurrentModelOption(this, 'anthropicModel', options);
           }
         } catch { /* fallback */ }
 
-        return defaultModels;
+        return preserveCurrentModelOption(this, 'anthropicModel', defaultModels);
       },
 
       async getOpenAiModels(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
@@ -1705,25 +1757,27 @@ export class UniversalChatModel implements INodeType {
           const response: any = await this.helpers.httpRequest({ method: 'GET', url: modelsUrl, headers, json: true });
           const rawList = response?.data || response?.models || (Array.isArray(response) ? response : null);
           if (Array.isArray(rawList) && rawList.length > 0) {
-            return rawList.map((m: any) => {
+            const options = rawList.map((m: any) => {
               const modelId = typeof m === 'string' ? m : (m.id || m.name || JSON.stringify(m));
               return { name: String(modelId), value: String(modelId) };
             });
+            return preserveCurrentModelOption(this, 'openaiModel', options);
           }
         } catch {
           try {
             const rootUrl = baseUrl.replace(/\/v1$/, '');
             const ollamaResp: any = await this.helpers.httpRequest({ method: 'GET', url: `${rootUrl}/api/tags`, headers, json: true });
             if (ollamaResp && Array.isArray(ollamaResp.models) && ollamaResp.models.length > 0) {
-              return ollamaResp.models.map((m: any) => {
+              const options = ollamaResp.models.map((m: any) => {
                 const name = m.name || m.model || JSON.stringify(m);
                 return { name: String(name), value: String(name) };
               });
+              return preserveCurrentModelOption(this, 'openaiModel', options);
             }
           } catch { /* fallback */ }
         }
 
-        return defaultModels;
+        return preserveCurrentModelOption(this, 'openaiModel', defaultModels);
       },
     },
   };

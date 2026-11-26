@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.43 - 2026-11-26
+
+- Corrige falha de hot-update sem reinício do container no n8n 2.32.6 (`The specified package could not be loaded` / `ENOENT` em `.../@langchain/core/node_modules/langsmith/run_trees.cjs`) ao atualizar a partir de versões anteriores (ex.: `1.0.34`–`1.0.37`):
+  - Fixa `langsmith` (`0.14.0`) diretamente em `dependencies`, instalando-o em um caminho limpo sob `node_modules/langsmith` (fora do caminho antigo cacheado pelo Node.js com `langsmith@<=0.10.9` em formato `*.cjs`).
+  - Aprimora o fallback de resolução em `AgentOutputBridge.ts` para limpar entradas obsoletas de `Module._pathCache` no hot-reload e validar `existsSync(resolved)` antes de retornar um caminho cacheado, prevenindo `ENOENT` em `Module.load()`.
+- Corrige reset de parâmetros e configurações ao trocar de credencial no nó no n8n 2.32.6:
+  - Ajusta `displayOptions` da credencial opcional `openAiCompatibleApi` com condição `{ _cnd: { eq: 'openai_compatible' } }`, evitando que o frontend do n8n classifique `provider` como `mainNodeAuthField`, reemita `parameters.provider` a cada troca de credencial e dispare o bug de `removeMismatchedOptionValues()` que apagava `geminiOptions`, `anthropicOptions` e `openaiOptions` (mantendo 100% de compatibilidade inclusive com workflows antigos sem `provider` explícito).
+  - Preserva o modelo atualmente selecionado em `getGeminiModels`, `getAnthropicModels` e `getOpenAiModels` quando a nova credencial retorna uma lista diferente ou falha temporariamente na consulta, impedindo o reset do dropdown de modelo para o valor padrão.
+
 ## 1.0.41 - 2026-10-23
 
 - Corrige falha de carregamento e atualização do pacote no n8n (`The specified package could not be loaded` / `Cannot find module '.../@langchain/core/node_modules/zod/v4/core/index.cjs'`) em ambientes de produção:

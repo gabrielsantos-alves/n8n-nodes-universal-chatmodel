@@ -489,7 +489,7 @@ function patchLoadedAgentClasses(): number {
 
 let patchChecksScheduled = false;
 const resolveFallbackSymbol = Symbol.for(
-  'n8n-nodes-universal-chatmodel.resolve-fallback-hook',
+  'n8n-nodes-universal-chatmodel.resolve-fallback-hook.v2',
 );
 
 function extractPackageName(request: string): string | undefined {
@@ -515,6 +515,24 @@ function getPackageRootDir(): string {
     return distCandidate;
   }
   return resolve(__dirname, '..', '..');
+}
+
+function purgeStalePathCacheForPackage(pkgRoot: string): void {
+  const moduleApi = Module as any;
+  const pathCache = moduleApi._pathCache;
+  if (!pathCache || typeof pathCache !== 'object') return;
+
+  for (const [key, value] of Object.entries(pathCache)) {
+    if (
+      key.includes(pkgRoot) ||
+      key.includes('n8n-nodes-universal-chatmodel') ||
+      (typeof value === 'string' &&
+        (value.includes(pkgRoot) ||
+          value.includes('n8n-nodes-universal-chatmodel')))
+    ) {
+      delete pathCache[key];
+    }
+  }
 }
 
 function ensureNestedNodeModulesFallbacks(): void {
@@ -549,9 +567,76 @@ function ensureNestedNodeModulesFallbacks(): void {
 
 function installStalePackageCacheFallback(): void {
   const moduleApi = Module as any;
+  const pkgRoot = getPackageRootDir();
+  const localNm = join(pkgRoot, 'node_modules');
+
+  // Always purge stale _pathCache entries belonging to this package on hot-reload,
+  // because Node.js can otherwise return a deleted file path (e.g. langsmith/run_trees.cjs)
+  // without throwing in _resolveFilename, causing ENOENT inside Module.load().
+  purgeStalePathCacheForPackage(pkgRoot);
+
   if (moduleApi[resolveFallbackSymbol] === true) return;
 
   const originalResolveFilename = moduleApi._resolveFilename;
+  const isBuiltin = (specifier: string): boolean =>
+    typeof (Module as any).isBuiltin === 'function'
+      ? (Module as any).isBuiltin(specifier)
+      : specifier.startsWith('node:');
+
+  const recover = (
+    request: string,
+    parent: NodeModule | undefined,
+    isMain: boolean,
+    originalErr: unknown,
+  ) => {
+    const pkgName =
+      typeof request === 'string' ? extractPackageName(request) : undefined;
+    if (pkgName && parent && Array.isArray(parent.paths)) {
+      const pathCache = moduleApi._pathCache;
+      if (pathCache && typeof pathCache === 'object') {
+        for (const key of Object.keys(pathCache)) {
+          if (key.includes(pkgName)) delete pathCache[key];
+        }
+      }
+
+      const fromOurPackage =
+        typeof parent.filename === 'string' &&
+        (parent.filename.startsWith(pkgRoot) ||
+          parent.filename.includes('n8n-nodes-universal-chatmodel'));
+
+      const candidatePaths = fromOurPackage
+        ? [localNm, ...parent.paths.filter((p: string) => p !== localNm)]
+        : parent.paths;
+
+      const validPaths = candidatePaths.filter((p: string) =>
+        existsSync(join(p, pkgName, 'package.json')),
+      );
+
+      for (const validPath of validPaths) {
+        try {
+          const singlePathParent = Object.assign(
+            Object.create(Object.getPrototypeOf(parent)),
+            parent,
+            { paths: [validPath] },
+          );
+          const resolved = originalResolveFilename.call(
+            moduleApi,
+            request,
+            singlePathParent,
+            isMain,
+            undefined,
+          );
+          if (typeof resolved === 'string' && existsSync(resolved)) {
+            return resolved;
+          }
+        } catch {
+          // Try next valid node_modules path that actually contains the required subpath
+        }
+      }
+    }
+    throw originalErr;
+  };
+
   moduleApi._resolveFilename = function (
     request: string,
     parent: NodeModule | undefined,
@@ -559,47 +644,24 @@ function installStalePackageCacheFallback(): void {
     options?: any,
   ) {
     try {
-      return originalResolveFilename.apply(this, arguments);
-    } catch (err: any) {
-      const pkgName =
-        typeof request === 'string' ? extractPackageName(request) : undefined;
-      if (pkgName && parent && Array.isArray(parent.paths)) {
-        const pathCache = moduleApi._pathCache;
-        if (pathCache && typeof pathCache === 'object') {
-          for (const key of Object.keys(pathCache)) {
-            if (key.includes(pkgName)) delete pathCache[key];
-          }
-        }
-
-        const localNm = join(getPackageRootDir(), 'node_modules');
-        const candidatePaths = [
-          localNm,
-          ...parent.paths.filter((p: string) => p !== localNm),
-        ];
-        const validPaths = candidatePaths.filter((p: string) =>
-          existsSync(join(p, pkgName, 'package.json')),
+      const resolved = originalResolveFilename.apply(this, arguments);
+      if (
+        typeof resolved === 'string' &&
+        !isBuiltin(resolved) &&
+        !existsSync(resolved)
+      ) {
+        return recover(
+          request,
+          parent,
+          isMain,
+          Object.assign(new Error(`Stale cached module path: ${resolved}`), {
+            code: 'MODULE_NOT_FOUND',
+          }),
         );
-
-        for (const validPath of validPaths) {
-          try {
-            const singlePathParent = Object.assign(
-              Object.create(Object.getPrototypeOf(parent)),
-              parent,
-              { paths: [validPath] },
-            );
-            return originalResolveFilename.call(
-              this,
-              request,
-              singlePathParent,
-              isMain,
-              options,
-            );
-          } catch {
-            // Try next valid node_modules path that actually contains the required subpath
-          }
-        }
       }
-      throw err;
+      return resolved;
+    } catch (err: any) {
+      return recover(request, parent, isMain, err);
     }
   };
 

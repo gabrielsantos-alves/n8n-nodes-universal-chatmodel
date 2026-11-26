@@ -115,6 +115,7 @@ test('package targets the runtime dependency set used by n8n 2.32.6', () => {
   assert.equal(packageJson.dependencies['@google/generative-ai'], '0.24.0');
   assert.equal(packageJson.dependencies['@langchain/google-genai'], '2.1.24');
   assert.equal(packageJson.dependencies['@langchain/openai'], '1.5.5');
+  assert.equal(packageJson.dependencies.langsmith, '0.14.0');
 });
 
 test('AnthropicMessageAugmenter is isolated and pure without importing langchain anthropic directly', () => {
@@ -168,6 +169,144 @@ test('AgentOutputBridge module resolution fallback recovers when npm deduplicate
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+test('AgentOutputBridge recovers when stale Module._pathCache points to deleted langsmith .cjs after hot update', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const Module = require('node:module');
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ucm-langsmith-hot-update-'));
+  try {
+    const nestedDir = path.join(tmp, 'node_modules', '@langchain', 'core', 'node_modules', 'fake-langsmith');
+    const hoistedDir = path.join(tmp, 'node_modules', 'fake-langsmith');
+    fs.mkdirSync(nestedDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(nestedDir, 'package.json'),
+      JSON.stringify({
+        name: 'fake-langsmith',
+        type: 'module',
+        exports: { './run_trees': { require: './run_trees.cjs' } },
+      }),
+    );
+    fs.writeFileSync(path.join(nestedDir, 'run_trees.cjs'), 'module.exports = { version: "0.8.11" };');
+
+    const parentMod = {
+      filename: path.join(tmp, 'node_modules', '@langchain', 'core', 'dist', 'tracers', 'base.cjs'),
+      paths: [
+        path.join(tmp, 'node_modules', '@langchain', 'core', 'node_modules'),
+        path.join(tmp, 'node_modules'),
+      ],
+    };
+
+    const firstResolved = Module._resolveFilename('fake-langsmith/run_trees', parentMod);
+    assert.equal(firstResolved, path.join(nestedDir, 'run_trees.cjs'));
+
+    // Replace nested .cjs package with hoisted .js CJS package (langsmith 0.8.x -> 0.14.0)
+    // WITHOUT clearing Module._pathCache manually, simulating n8n's unloadAll().
+    fs.rmSync(nestedDir, { recursive: true, force: true });
+    fs.mkdirSync(hoistedDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(hoistedDir, 'package.json'),
+      JSON.stringify({
+        name: 'fake-langsmith',
+        type: 'commonjs',
+        exports: { './run_trees': { require: './run_trees.js' } },
+      }),
+    );
+    fs.writeFileSync(path.join(hoistedDir, 'run_trees.js'), 'module.exports = { version: "0.14.0" };');
+
+    const secondResolved = Module._resolveFilename('fake-langsmith/run_trees', parentMod);
+    assert.equal(secondResolved, path.join(hoistedDir, 'run_trees.js'));
+    assert.deepEqual(require(secondResolved), { version: '0.14.0' });
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('switching credentials does not trigger n8n mainAuthField parameter reset and preserves selected model', async () => {
+  const { NodeHelpers } = require('n8n-workflow');
+  const node = new UniversalChatModel();
+  const description = node.description;
+
+  // Verify n8n's findAlternativeAuthField() does NOT classify `provider` as mainNodeAuthField
+  // (all provider values must NOT be covered solely by credentials[].displayOptions.show).
+  const providerProp = description.properties.find((p) => p.name === 'provider');
+  const shownProviderValues = new Set();
+  for (const cred of description.credentials) {
+    for (const val of cred.displayOptions?.show?.provider ?? []) {
+      shownProviderValues.add(String(val));
+    }
+  }
+  const allProviderValuesCoveredByShow = providerProp.options.every((opt) =>
+    shownProviderValues.has(String(opt.value)),
+  );
+  assert.equal(allProviderValuesCoveredByShow, false);
+
+  // Verify each provider still displays ONLY its matching credential via NodeHelpers.displayParameter
+  const visibleCredsFor = (provider) =>
+    description.credentials
+      .filter((cred) =>
+        NodeHelpers.displayParameter(
+          { provider },
+          cred,
+          { typeVersion: 1 },
+          description,
+        ),
+      )
+      .map((cred) => cred.name);
+
+  assert.deepEqual(visibleCredsFor('gemini'), ['googleGeminiApi']);
+  assert.deepEqual(visibleCredsFor('anthropic'), ['anthropicApi']);
+  assert.deepEqual(visibleCredsFor('openai_compatible'), ['openAiCompatibleApi']);
+
+  // Also verify saved legacy workflows with omitted default `provider` never show openAiCompatibleApi
+  const visibleWhenProviderOmitted = description.credentials
+    .filter((cred) =>
+      NodeHelpers.displayParameter({}, cred, { typeVersion: 1 }, description),
+    )
+    .map((cred) => cred.name);
+  assert.deepEqual(visibleWhenProviderOmitted, []);
+
+  // Verify dynamic loadOptions methods keep the currently selected model on credential swap
+  const geminiOptions = await node.methods.loadOptions.getGeminiModels.call({
+    getCredentials: async () => ({ apiKey: 'test-key' }),
+    getCurrentNodeParameter: (name) => (name === 'geminiModel' ? 'gemini-2.5-pro-custom' : undefined),
+    helpers: {
+      httpRequest: async () => {
+        throw new Error('temporary network error');
+      },
+    },
+  });
+  assert.equal(
+    geminiOptions.some((opt) => opt.value === 'gemini-2.5-pro-custom'),
+    true,
+  );
+
+  const anthropicOptions = await node.methods.loadOptions.getAnthropicModels.call({
+    getCredentials: async () => ({ apiKey: 'test-key' }),
+    getCurrentNodeParameter: (name) => (name === 'anthropicModel' ? 'claude-custom-model' : undefined),
+    helpers: {
+      httpRequest: async () => ({ data: [{ id: 'claude-sonnet-5-5', display_name: 'Claude Sonnet 5.5' }] }),
+    },
+  });
+  assert.equal(
+    anthropicOptions.some((opt) => opt.value === 'claude-custom-model'),
+    true,
+  );
+
+  const openAiOptions = await node.methods.loadOptions.getOpenAiModels.call({
+    getCredentials: async () => ({ baseUrl: 'http://localhost:11434/v1', apiKey: 'new-key' }),
+    getCurrentNodeParameter: (name) => (name === 'openaiModel' ? 'my-custom-vllm-model' : undefined),
+    helpers: {
+      httpRequest: async () => ({ data: [{ id: 'gpt-4o' }] }),
+    },
+  });
+  assert.equal(
+    openAiOptions.some((opt) => opt.value === 'my-custom-vllm-model'),
+    true,
+  );
 });
 
 test('Gemini generation controls are optional collection entries', () => {
